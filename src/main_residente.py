@@ -1,13 +1,22 @@
 import sys
 import os
 import threading
+import base64  # Necessário para decodificar a string da imagem
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QStyle
-from PySide6.QtGui import QIcon, QCloseEvent
+from PySide6.QtGui import QIcon, QCloseEvent, QPixmap # Adicionado QPixmap para processar a imagem
 
 # Importando suas classes originais
 from interface import SiriusInterfaceMainWindow
 from chatbot import SiriusChat
 from audio_handler import SiriusAudio
+
+# Ajuste do Import: Entra na PASTA config e importa do ARQUIVO config.py
+try:
+    from config.config import LOGO_SIRIUS_B64
+except ImportError:
+    # Caso o Python não encontre a pasta no PATH
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from config.config import LOGO_SIRIUS_B64
 
 class SiriusAppPrincipal(SiriusInterfaceMainWindow):
     def __init__(self):
@@ -19,28 +28,51 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
         self.audio = SiriusAudio()
         self.ativo = True
 
-        # --- CONFIGURAÇÃO DA LOGO E CAMINHOS ---
-        diretorio_atual = os.path.dirname(os.path.abspath(__file__))
-        caminho_logo = os.path.join(diretorio_atual, "img", "logo_sirius.png")
-        
-        if os.path.exists(caminho_logo):
-            self.setWindowIcon(QIcon(caminho_logo))
+        # --- CONFIGURAÇÃO DA LOGO VIA BASE64 ---
+        # Obtemos o ícone uma única vez para usar na janela e na bandeja
+        self.icone_sirius = self.obter_icone_sirius()
+        self.setWindowIcon(self.icone_sirius)
         
         # --- CONFIGURAR SYSTEM TRAY (BANDEJA) ---
-        self.tray = QSystemTrayIcon(self)
-        if os.path.exists(caminho_logo):
-            self.tray.setIcon(QIcon(caminho_logo))
-        else:
-            self.tray.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.configurar_bandeja()
 
+    def obter_icone_sirius(self):
+        """Converte a string Base64 do arquivo config/config.py em um QIcon"""
+        try:
+            # Transforma o texto em bytes de imagem
+            img_data = base64.b64decode(LOGO_SIRIUS_B64)
+            pixmap = QPixmap()
+            # Carrega a imagem direto da memória
+            pixmap.loadFromData(img_data)
+            
+            if pixmap.isNull():
+                raise ValueError("Pixmap está vazio. Verifique o código Base64.")
+                
+            return QIcon(pixmap)
+        except Exception as e:
+            print(f"Erro ao carregar ícone embutido: {e}")
+            # Se falhar, usa um ícone padrão do sistema (computador) para não ficar invisível
+            return self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+    def configurar_bandeja(self):
+        """Inicializa e exibe o ícone na bandeja do sistema"""
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.icone_sirius)
+        self.tray.setToolTip("S.I.R.I.U.S. - Assistente Ativo")
+
+        # Menu da bandeja
         menu = QMenu()
         menu.addAction("Abrir Sirius", self.showNormal)
         menu.addSeparator()
         menu.addAction("Sair Completamente", self.sair_total)
         
         self.tray.setContextMenu(menu)
-        self.tray.show()
+        
+        # Conecta o clique no ícone
         self.tray.activated.connect(self.on_tray_icon_activated)
+        
+        # EXIBE o ícone (Obrigatório para aparecer)
+        self.tray.show()
 
     # --- CONEXÃO DA INTELIGÊNCIA ---
     def processar_resposta_ia(self, texto_resposta):
@@ -51,11 +83,10 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
         if not texto_resposta:
             return
 
-        # 1. Faz o Sirius falar
-        # Usamos uma thread para o áudio não travar a animação da esfera
+        # 1. Faz o Sirius falar em segundo plano
         threading.Thread(target=self.audio.falar, args=(texto_resposta,), daemon=True).start()
         
-        # 2. Mostra no log do terminal (como você viu antes)
+        # 2. Mostra no log do terminal
         print(f"\n[Sirius]: {texto_resposta}")
 
     def on_tray_icon_activated(self, reason):
@@ -64,7 +95,7 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
             self.activateWindow()
 
     def closeEvent(self, event: QCloseEvent):
-        """Esconde a janela mas mantém o processo vivo"""
+        """Esconde a janela mas mantém o processo vivo na bandeja"""
         if self.ativo:
             event.ignore()
             self.hide()
@@ -83,6 +114,8 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # Impede que o app feche quando a janela principal for escondida
     app.setQuitOnLastWindowClosed(False)
     
     sirius = SiriusAppPrincipal()

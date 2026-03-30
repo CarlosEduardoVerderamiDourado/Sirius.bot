@@ -1,22 +1,11 @@
 import base64
-import os
 
-def transformar_em_base64(nome_arquivo, caminho_relativo):
-    if os.path.exists(caminho_relativo):
-        with open(caminho_relativo, "rb") as image_file:
-            # Transforma a imagem em código de texto
-            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-            print(f"\n=== CÓDIGO BASE64 DE: {nome_arquivo} ===")
-            print(encoded_string)
-            print("=" * 40)
-    else:
-        print(f"Erro: O arquivo {caminho_relativo} não foi encontrado!")
+# Substitua pelas suas chaves REAIS aqui apenas para gerar o arquivo
+key_gemini = "AIzaSyCbaWXAyvD-BI_PUoRbFpCu3mpeHpV_0Rg"
+key_eleven = "sk_92caee349c486c29d63fa5cac8ec35299aab88f314528176"
 
-# --- EXECUTE PARA A LOGO ---
-# Ajuste o caminho se sua logo estiver em outro lugar
-transformar_em_base64("LOGO_SIRIUS", "src/img/logo_sirius.png")
+with open("key_gemini.txt", "w") as f:
+    f.write(base64.b64encode(key_gemini.encode()).decode())
 
-# --- OPCIONAL: EXECUTE PARA AS CHAVES (Se quiser esconder no código) ---
-# chave_gemini = "SUA_CHAVE_AQUI"
-# print("\n=== BASE64 DA CHAVE GEMINI ===")
-# print(base64.b64encode(chave_gemini.encode()).decode())
+with open("key_eleven.txt", "w") as f:
+    f.write(base64.b64encode(key_eleven.encode()).decode())

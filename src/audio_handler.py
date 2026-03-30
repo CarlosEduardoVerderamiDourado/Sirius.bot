@@ -159,7 +159,7 @@ class SiriusAudio:
     def aguardar_ativacao(self):
         """Escuta em standby até ouvir 'Sirius'."""
         fs = 44100
-        seconds = 4 # Ajustado para 4s para melhor equilíbrio
+        seconds = 5 
         filename = 'trigger.wav'
         print("\033[90m[Standby: Diga 'Sirius']\033[0m")
         try:
@@ -185,7 +185,7 @@ class SiriusAudio:
     def ouvir(self):
         """Capta o comando de voz do usuário."""
         fs = 44100  
-        seconds = 7 # 7 segundos é o tempo ideal para frases naturais
+        seconds = 10 
         filename = 'temp_audio_sirius.wav'
         try:
             sd.stop() 

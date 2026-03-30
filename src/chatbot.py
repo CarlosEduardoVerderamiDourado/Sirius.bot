@@ -7,27 +7,20 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 
-# 1. Configuração de Pastas e Chave
-base_dir = os.path.dirname(os.path.abspath(__file__))
-env_path = os.path.join(base_dir, '..', 'config', '.env')
-load_dotenv(dotenv_path=env_path, override=True)
-
-# --- BACKUP DE SEGURANÇA (BASE64) ---
-# Caso o .env falhe no executável, ele tenta usar a chave embutida
-_GEM_B64 = "COLE_AQUI_O_RESULTADO_DO_GERAR_KEY_DO_GEMINI"
-
-def decodificar_key(texto_b64):
-    try:
-        if texto_b64 and len(texto_b64) > 10:
-            return base64.b64decode(texto_b64).decode('utf-8')
-    except: return None
-    return None
-
-gemini_key = os.getenv("GEMINI_API_KEY") or decodificar_key(_GEM_B64)
+# --- AJUSTE PARA O EXECUTÁVEL ---
+# Importamos a chave já tratada pelo seu sistema de config
+try:
+    from config.config import GEMINI_API_KEY as gemini_key
+except ImportError:
+    # Caso rode fora da estrutura de pastas, mantém o fallback original
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(base_dir, '..', 'config', '.env')
+    load_dotenv(dotenv_path=env_path, override=True)
+    gemini_key = os.getenv("GEMINI_API_KEY")
 
 # 2. Configuração do Modelo
 llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest", # Versão rápida e estável
+    model="gemini-flash-latest", # Atualizado para a versão mais estável
     google_api_key=gemini_key,
     temperature=0.7,
 )
@@ -66,11 +59,9 @@ class SiriusChat:
             resposta = sirius_com_memoria.invoke({"input": user_input}, config=self.config)
             
             # --- FILTRAGEM ROBUSTA ---
-            # Pegamos o conteúdo bruto (pode ser string, objeto ou lista)
             conteudo = getattr(resposta, 'content', resposta)
             
             if isinstance(conteudo, list):
-                # Varre a lista e pega o PRIMEIRO texto que encontrar, ignorando metadados
                 for item in conteudo:
                     if isinstance(item, dict) and 'text' in item:
                         return item['text'].strip()
