@@ -1,5 +1,6 @@
 import os
 import sys
+import base64
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -8,29 +9,38 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 
 # 1. Configuração de Pastas e Chave
 base_dir = os.path.dirname(os.path.abspath(__file__))
-# Garante que ele suba um nível para achar a pasta config mesmo se rodar de dentro da src
 env_path = os.path.join(base_dir, '..', 'config', '.env')
 load_dotenv(dotenv_path=env_path, override=True)
 
-# 2. Configuração do Modelo (Forçando a rota estável)
+# --- BACKUP DE SEGURANÇA (BASE64) ---
+# Caso o .env falhe no executável, ele tenta usar a chave embutida
+_GEM_B64 = "COLE_AQUI_O_RESULTADO_DO_GERAR_KEY_DO_GEMINI"
+
+def decodificar_key(texto_b64):
+    try:
+        if texto_b64 and len(texto_b64) > 10:
+            return base64.b64decode(texto_b64).decode('utf-8')
+    except: return None
+    return None
+
+gemini_key = os.getenv("GEMINI_API_KEY") or decodificar_key(_GEM_B64)
+
+# 2. Configuração do Modelo
 llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest", # Atualizado para a versão mais estável de 2026
-    google_api_key=os.getenv("GEMINI_API_KEY"),
+    model="gemini-flash-latest", # Versão rápida e estável
+    google_api_key=gemini_key,
     temperature=0.7,
-    model_kwargs={"api_version": "v1"} 
 )
 
-# 3. Definição do Prompt e Memória (Padrão 2026)
+# 3. Definição do Prompt e Memória
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "Você é o Sirius (Sistema Inteligente de respostas integradas e unificadas): assistente virtual prestativo, zoeiro e inteligente. Seus criadores se chamam Antonio Angelo, Carlos Dourado e Lucas Delarovere (mas não precisa falar sobre eles toda hora, só quando te perguntarem)."),
+    ("system", "Você é o Sirius (Sistema Inteligente de Respostas Integradas e Unificadas): assistente virtual prestativo, zoeiro e inteligente. Seus criadores se chamam Antonio Angelo, Carlos Dourado e Lucas Delarovere. Responda de forma direta e curta para facilitar a fala."),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}"),
 ])
 
-# Criamos a corrente (chain) ligando o prompt ao modelo
 chain = prompt | llm
 
-# Gerenciador de histórico simples para a sessão
 store = {}
 
 def get_session_history(session_id: str):
@@ -38,7 +48,6 @@ def get_session_history(session_id: str):
         store[session_id] = ChatMessageHistory()
     return store[session_id]
 
-# 4. A Corrente com Memória
 sirius_com_memoria = RunnableWithMessageHistory(
     chain,
     get_session_history,
@@ -53,26 +62,35 @@ class SiriusChat:
 
     def responder(self, user_input):
         try:
+            # Chama a IA com a memória
             resposta = sirius_com_memoria.invoke({"input": user_input}, config=self.config)
             
-            # Extração limpa do conteúdo da resposta
-            if hasattr(resposta, 'content'):
-                return str(resposta.content)
-            return str(resposta)
+            # --- FILTRAGEM ROBUSTA ---
+            # Pegamos o conteúdo bruto (pode ser string, objeto ou lista)
+            conteudo = getattr(resposta, 'content', resposta)
+            
+            if isinstance(conteudo, list):
+                # Varre a lista e pega o PRIMEIRO texto que encontrar, ignorando metadados
+                for item in conteudo:
+                    if isinstance(item, dict) and 'text' in item:
+                        return item['text'].strip()
+                    elif isinstance(item, str):
+                        return item.strip()
+            
+            return str(conteudo).strip()
             
         except Exception as e:
             if "429" in str(e):
-                return "Sirius: Calma aí, apressadinho! O Google me deu um gelo (limite de cota). Tenta de novo em um minuto."
-            return f"Sirius: Eita, deu erro aqui: {e}"
+                return "Calma aí! O Google me deu um gelo. Tenta de novo em um minuto."
+            return f"Eita, deu erro aqui: {e}"
 
-# --- Mantendo o seu Modo Texto Original ---
+# --- Modo Texto Original ---
 if __name__ == "__main__":
     chat_teste = SiriusChat()
     print("--- Sirius Online (Modo Texto) ---")
     while True:
         user_input = input("Você: ")
         if user_input.lower() in ["sair", "exit", "tchau"]:
-            print("Sirius: Fui! Se precisar de mais inteligência (ou de uma piada), é só chamar.")
             break
         
         resposta_final = chat_teste.responder(user_input)

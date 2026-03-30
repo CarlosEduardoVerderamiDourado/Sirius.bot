@@ -5,7 +5,7 @@ import threading
 import os
 import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, 
-                             QLabel, QFrame, QLineEdit, QPushButton, QTextEdit)
+                                QLabel, QFrame, QLineEdit, QPushButton, QTextEdit)
 from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
@@ -71,7 +71,22 @@ class SiriusWorker(QThread):
                         config = {"configurable": {"session_id": "sessao_sirius_final"}}
                         resultado = sirius_com_memoria.invoke({"input": comando_str}, config=config)
                         
-                        resposta_texto = resultado.content if hasattr(resultado, 'content') else str(resultado)
+                        conteudo = getattr(resultado, 'content', resultado)
+                        
+                        if isinstance(conteudo, list):
+                            resposta_texto = ""
+                            for item in conteudo:
+                                if isinstance(item, dict) and 'text' in item:
+                                    resposta_texto = item['text']
+                                    break
+                        else:
+                            resposta_texto = str(conteudo)
+
+                        if "extras':" in resposta_texto:
+                            resposta_texto = resposta_texto.split("extras':")[0]
+                        
+                        resposta_texto = resposta_texto.replace("[{", "").replace("}]", "").strip()
+                        
                     else:
                         resposta_texto = "Conexão com o núcleo neural perdida."
                         
@@ -81,17 +96,15 @@ class SiriusWorker(QThread):
                 if resposta_texto:
                     self.resposta_pronta.emit(str(resposta_texto))
                     
-                    # Inicia animação de fala e bloqueia o thread até o áudio acabar
                     self.status_fala.emit(True)
                     try:
                         self.audio.falar(resposta_texto)
                     finally:
-                        # Garante que a esfera volte ao normal após a fala
                         self.status_fala.emit(False)
 
             time.sleep(0.1)
 
-# --- VISUALIZAÇÃO 3D (Mantida conforme original com correções de performance) ---
+# --- VISUALIZAÇÃO 3D ---
 class SiriusNexus3DView(QOpenGLWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -256,18 +269,30 @@ class SiriusInterfaceMainWindow(QMainWindow):
     def set_fala_view(self, status):
         self.core_view.esta_falando = status
 
+    # --- CORREÇÃO DO BUG DE ALTERNÂNCIA ---
     def alternar_interface(self):
-        vis = self.hud_chat.isVisible()
-        self.hud_chat.setVisible(not vis)
-        self.worker.modo_voz_ativo = not vis
-        self.btn_toggle.setText("VOZ" if vis else "TEXTO")
-        if not vis: self.input_texto.setFocus()
+        painel_visivel = self.hud_chat.isVisible()
+        nova_visibilidade = not painel_visivel
+        
+        self.hud_chat.setVisible(nova_visibilidade)
+        self.worker.modo_voz_ativo = not nova_visibilidade
+        
+        # Reset de estado ao voltar para voz
+        if not nova_visibilidade: 
+            with self.worker.lock:
+                self.worker.comando_manual = None
+            print("\033[94m[Sistema]: Modo Voz Reativado.\033[0m")
+        
+        self.btn_toggle.setText("VOZ" if nova_visibilidade else "TEXTO")
+        if nova_visibilidade: 
+            self.input_texto.setFocus()
 
     def enviar_texto_manual(self):
         t = self.input_texto.text()
         if t.strip():
             self.worker.enviar_comando_texto(t)
             self.input_texto.clear()
+            self.input_texto.setFocus() # Mantém o foco para agilizar o uso
 
     def log_usuario(self, t):
         self.chat_history.append(f"<p style='color:white; margin: 5px;'><b>👤 Você:</b> {t}</p>")
