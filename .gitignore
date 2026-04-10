@@ -1,8 +1,12 @@
-# --- SEGURANÇA (NÃO SUBIR DE JEITO NENHUM) ---
+.venv311/
+# --- SEGURANÇA ---
 .env
 config/.env
-*.txt           # Bloqueia key_gemini.txt, key_eleven.txt e codigo_base64.txt
-!README.txt     # (Opcional) Se tiver um README em txt que queira subir, use o "!"
+# Bloqueia arquivos de texto sensíveis mas permite o essencial para o Git
+*.txt
+!requirements.txt
+!README.txt
+!instrucoes.txt
 
 # --- PYTHON & CACHE ---
 __pycache__/
@@ -11,6 +15,7 @@ __pycache__/
 *$py.class
 *.log
 logs/
+*.db
 
 # --- AMBIENTE VIRTUAL ---
 venv/

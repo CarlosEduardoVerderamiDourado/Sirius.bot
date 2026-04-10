@@ -25,8 +25,10 @@ else:
 
 # --- FUNÇÕES DE APOIO ---
 def ler_arquivo_txt(nome_arquivo):
-    """Lê o conteúdo de um arquivo de texto na raiz do projeto"""
-    caminho = os.path.join(raiz_projeto, nome_arquivo)
+    """Lê o conteúdo de um arquivo de texto na pasta config"""
+    # Mudamos aqui: agora ele olha dentro da pasta 'config' da raiz
+    caminho = os.path.join(raiz_projeto, 'config', nome_arquivo) 
+    
     if os.path.exists(caminho):
         try:
             with open(caminho, "r", encoding="utf-8") as f:
