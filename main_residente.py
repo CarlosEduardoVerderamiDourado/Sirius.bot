@@ -5,7 +5,7 @@ import base64
 import time
 import random
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +134,16 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
     """
 
     def __init__(self):
-        super().__init__()
+        # Cria o cerebro UMA unica vez e injeta na interface
+        # Evita dupla inicializacao de agentes/scheduler/leitor
         self.cerebro = SiriusCerebro()
         self.ativo   = True
+        super().__init__(cerebro=self.cerebro)  # injeta — nao cria novo
 
         self._iniciar_aprendizado_autonomo()
         self._iniciar_treinador_autonomo()
+        # Registra coordenador e treinador no scheduler apos inicializacao
+        self._registrar_subsistemas_no_scheduler()
 
         self.icone_sirius = self._obter_icone_sirius()
         self.setWindowIcon(self.icone_sirius)
@@ -184,7 +188,7 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
         threading.Thread(target=self._subconsciente.iniciar_estudos, daemon=True).start()
 
     def _iniciar_treinador_autonomo(self):
-        """Inicia o retreino periódico das redes neurais (a cada 2 horas)."""
+        """Inicia o retreino periodico das redes neurais (a cada 2 horas)."""
         if not _TREINADOR_DISPONIVEL:
             return
         try:
@@ -193,6 +197,17 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
             print("[MAIN]: SiriusTreinador iniciado (ciclo de 2h).")
         except Exception as e:
             print(f"[MAIN]: Falha ao iniciar SiriusTreinador: {e}")
+
+    def _registrar_subsistemas_no_scheduler(self):
+        """Conecta coordenador e treinador ao scheduler apos inicializacao."""
+        try:
+            coordenador = getattr(self, '_coordenador', None)
+            treinador   = getattr(self, '_treinador', None)
+            if self.cerebro._scheduler and (coordenador or treinador):
+                self.cerebro._registrar_scheduler(coordenador, treinador)
+                print("[MAIN]: Scheduler conectado ao coordenador e treinador.")
+        except Exception as e:
+            print(f"[MAIN]: Falha ao registrar scheduler: {e}")
 
     # ------------------------------------------------------------------
     # Interface e bandeja

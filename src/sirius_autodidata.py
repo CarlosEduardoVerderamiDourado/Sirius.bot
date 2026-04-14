@@ -296,6 +296,36 @@ class FilaDeTemas:
         if tema not in self._fila_descobertos and tema not in TODOS_OS_TEMAS:
             self._fila_descobertos.append(tema)
 
+    # Verbos de acao — nao sao temas de estudo
+    _VERBOS_ACAO = {
+        "abre", "abrir", "fecha", "fechar", "manda", "mandar", "mande",
+        "envia", "enviar", "cria", "criar", "salva", "salvar", "desliga",
+        "desligar", "pesquise", "busque", "procure", "executa", "executar",
+        "liga", "ligar", "mostra", "mostrar", "toca", "tocar", "pausa",
+        "volume", "screenshot", "print", "instala", "instalar",
+    }
+    # Perguntas de contexto imediato — nao tem resposta na Wikipedia
+    _PERGUNTAS_CONTEXTO = {
+        "que horas", "que dia", "qual data", "quantos anos",
+        "como voce esta", "tudo bem", "oi", "ola", "bom dia",
+        "boa tarde", "boa noite", "tchau", "flw", "valeu",
+    }
+
+    def _eh_tema_estudavel(self, pergunta: str) -> bool:
+        """Retorna True apenas se a pergunta for um tema que vale pesquisar."""
+        p = pergunta.lower().strip()
+        # Filtra comandos de acao (primeira palavra e verbo de acao)
+        primeira = p.split()[0] if p.split() else ""
+        if primeira in self._VERBOS_ACAO:
+            return False
+        # Filtra perguntas de contexto imediato
+        if any(ctx in p for ctx in self._PERGUNTAS_CONTEXTO):
+            return False
+        # Filtra textos muito curtos (menos de 3 palavras)
+        if len(p.split()) < 3:
+            return False
+        return True
+
     def puxar_perguntas_usuario(self):
         try:
             conn = sqlite3.connect(DB_PESSOAL)
@@ -309,6 +339,7 @@ class FilaDeTemas:
                 pergunta = re.sub(r"\bsirius\b[,\s]*", "", pergunta).strip()
                 if (
                     len(pergunta) > 5
+                    and self._eh_tema_estudavel(pergunta)
                     and pergunta not in self._fila_usuario
                     and pergunta not in self._historico_recente
                 ):
@@ -431,19 +462,7 @@ def _buscar_web(tema: str) -> list[dict]:
     except Exception as e:
         print(f"[AUTODIDATA]: ddgs erro para '{tema}': {e}")
 
-    # Fallback pacote antigo
-    if not resultados_raw:
-        try:
-            from duckduckgo_search import DDGS as DDGSAntigo
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                with DDGSAntigo() as ddgs:
-                    resultados_raw = list(ddgs.text(tema, max_results=3))
-        except ImportError:
-            print("[AUTODIDATA]: Instale: pip install ddgs")
-        except Exception as e:
-            print(f"[AUTODIDATA]: duckduckgo_search erro para '{tema}': {e}")
+    # (fallback removido — use apenas: pip install ddgs)
 
     return [
         {

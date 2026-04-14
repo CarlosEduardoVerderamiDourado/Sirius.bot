@@ -92,51 +92,60 @@ class AgentePesquisador(AgenteBase):
     descricao = "Pesquisa na web e sintetiza informações"
 
     def executar(self, tema: str, contexto: dict = None) -> str:
-        resultados = []
+        resultados_pt  = []   # resultados em portugues (prioridade)
+        resultados_gen = []   # fallback
 
-        # 1. Wikipedia
+        # 1. Wikipedia PT — sempre em portugues
         try:
             import requests
-            for lang in ["pt", "en"]:
-                url  = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{tema.replace(' ', '_')}"
-                resp = requests.get(url, timeout=6)
-                if resp.status_code == 200:
-                    ct = resp.headers.get("Content-Type", "")
-                    if "json" in ct:
-                        dados   = resp.json()
-                        extrato = dados.get("extract", "")
-                        if extrato and len(extrato) > 80:
-                            resultados.append(f"[Wikipedia] {extrato[:400]}")
-                            break
+            url  = 'https://pt.wikipedia.org/api/rest_v1/page/summary/' + tema.replace(' ', '_')
+            resp = requests.get(url, timeout=6)
+            if resp.status_code == 200 and 'json' in resp.headers.get('Content-Type', ''):
+                dados   = resp.json()
+                extrato = dados.get('extract', '')
+                if extrato and len(extrato) > 80:
+                    resultados_pt.append(extrato[:500])
         except Exception as e:
-            print(f"[AGENTE Pesquisador]: Wikipedia: {e}")
+            print('[AGENTE Pesquisador]: Wikipedia PT: {}'.format(e))
 
-        # 2. DuckDuckGo
-        try:
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                busca = list(ddgs.text(tema, max_results=2))
-            for r in busca:
-                if isinstance(r, dict) and r.get("body"):
-                    resultados.append(f"[Web] {r['body'][:300]}")
-        except Exception as e:
-            print(f"[AGENTE Pesquisador]: DDG: {e}")
+        # 2. Wikipedia EN so se PT nao achou — pega apenas o primeiro paragrafo
+        if not resultados_pt:
+            try:
+                import requests
+                url  = 'https://en.wikipedia.org/api/rest_v1/page/summary/' + tema.replace(' ', '_')
+                resp = requests.get(url, timeout=6)
+                if resp.status_code == 200 and 'json' in resp.headers.get('Content-Type', ''):
+                    extrato = resp.json().get('extract', '')
+                    if extrato and len(extrato) > 80:
+                        primeiro = extrato.split('. ')[0] + '.'
+                        resultados_gen.append(primeiro[:300])
+            except Exception:
+                pass
+
+        # 3. DuckDuckGo PT (busca em sites br)
+        if not resultados_pt:
+            try:
+                from ddgs import DDGS
+                query = tema + ' site:pt.wikipedia.org OR site:brasilescola.uol.com.br OR site:mundoeducacao.uol.com.br'
+                with DDGS() as ddgs:
+                    busca = list(ddgs.text(query, max_results=2))
+                for r in busca:
+                    if isinstance(r, dict) and r.get('body') and len(r['body']) > 50:
+                        resultados_pt.append(r['body'][:400])
+            except Exception as e:
+                print('[AGENTE Pesquisador]: DDG PT: {}'.format(e))
+
+        resultados = resultados_pt if resultados_pt else resultados_gen
 
         if not resultados:
-            return f"Não encontrei informações sobre '{tema}' neste momento."
+            return "Nao encontrei informacoes sobre '{}' agora.".format(tema)
 
-        resumidor = AgenteResumidor(self.memoria)
-        texto_completo = "\n\n".join(resultados)
-        resumo = resumidor.executar(texto_completo)
+        resumidor      = AgenteResumidor(self.memoria)
+        texto_completo = '\n\n'.join(resultados)
+        resumo         = resumidor.executar(texto_completo)
 
-        self._salvar_resultado(tema, texto_completo, "pesquisador")
+        self._salvar_resultado(tema, texto_completo, 'pesquisador')
         return resumo
-
-
-# ---------------------------------------------------------------------------
-# Agente Analisador
-# ---------------------------------------------------------------------------
-
 class AgenteAnalisador(AgenteBase):
     nome      = "Analisador"
     descricao = "Analisa arquivos e dados, extrai insights"
@@ -318,10 +327,29 @@ class SiriusAgentes:
             texto = contexto.get("texto", comando) if contexto else comando
             return self.resumidor.executar(texto)
 
-        if any(p in cmd for p in ["pesquisa", "pesquise", "procure", "busque",
-                                    "o que é", "quem é", "como funciona"]):
-            tema = re.sub(r"(pesquisa|pesquise|procure|busque|o que é|quem é|como funciona)\s*", "", cmd).strip()
-            return self.pesquisador.executar(tema or comando)
+        # Padrões de pesquisa — qualquer pergunta de conhecimento
+        _TRIGGERS_PESQUISA = {
+            "pesquisa", "pesquise", "procure", "busque",
+            "o que é", "o que e", "oque e", "oque é",
+            "que e ", "que é ",        # "que e pokemon"
+            "quem é", "quem e",
+            "como funciona", "como é", "como e ",
+            "me fala", "me fale", "me explica", "me conta",
+            "explica ", "explique",
+            "conta sobre", "fala sobre",
+            "historia de", "história de",
+            "o que foi", "o que são", "o que sao",
+            "pra que serve", "para que serve",
+        }
+        if any(p in cmd for p in _TRIGGERS_PESQUISA):
+            # Remove o trigger e usa o restante como tema
+            tema = cmd
+            for p in sorted(_TRIGGERS_PESQUISA, key=len, reverse=True):
+                if p in tema:
+                    tema = tema.replace(p, " ").strip()
+                    break
+            tema = tema.strip() or comando
+            return self.pesquisador.executar(tema)
 
         if any(p in cmd for p in ["analisa", "analise", "analisa", "lê", "leia", "abra"]):
             caminho = contexto.get("arquivo") if contexto else None

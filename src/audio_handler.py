@@ -31,8 +31,55 @@ WAKE_WORD_VARIANTES = {
 }
 
 
+
+def _eh_transcricao_ruim(texto: str) -> bool:
+    """
+    Detecta transcrições que são eco, repetição ou ruído do microfone.
+    Evita salvar lixo no banco e processar comandos fantasmas.
+    """
+    import re as _re
+    from collections import Counter as _Counter
+
+    t = texto.strip().lower()
+
+    # Muito curto
+    if len(t.split()) < 2:
+        return True
+
+    # Só pontuação ou reticências
+    if _re.match(r'^[.\s…,!?]+$', t):
+        return True
+
+    palavras = t.split()
+
+    # Mais de 50% das palavras são iguais = eco
+    if len(palavras) >= 4:
+        freq      = _Counter(palavras)
+        mais_freq = freq.most_common(1)[0][1]
+        if mais_freq / len(palavras) > 0.5:
+            return True
+
+    # Frases repetidas = eco do TTS
+    sentencas = [s.strip() for s in _re.split(r'[.!?]', t) if len(s.strip()) > 3]
+    if len(sentencas) >= 2:
+        unicas = set(sentencas)
+        if len(unicas) < len(sentencas) * 0.6:
+            return True
+
+    # Padrões de ruído
+    padroes = [
+        r'^(um,?\s*){3,}',
+        r'^(é,?\s*){3,}',
+        r'(.{4,})\1{2,}',
+    ]
+    for p in padroes:
+        if _re.search(p, t):
+            return True
+
+    return False
+
 class SiriusAudio:
-    def __init__(self):
+    def __init__(self, usar_wakeword: bool = True, picovoice_key: str = None):
         self.api_key  = ELEVENLABS_API_KEY
         self.voice_id = VOICE_ID
 
@@ -42,12 +89,28 @@ class SiriusAudio:
         if not pygame.mixer.get_init():
             pygame.mixer.init()
 
-        # ✅ Flag de mute — bloqueia escuta enquanto Sirius fala
+        # Flag de mute — bloqueia escuta enquanto Sirius fala
         self._falando       = False
-        self._lock_tts      = threading.Lock()  # evita pyttsx3 em paralelo
+        self._lock_tts      = threading.Lock()
+
+        # Flag de wake word — quando True, o próximo escutar_fluxo_continuo
+        # captura o comando mesmo sem "sirius" no texto
+        self._wake_ativada  = threading.Event()
+        self._wakeword      = None
 
         self._voice_id_windows = None
         self._configurar_voz_local()
+
+        # Inicia wake word em background
+        # So ativa se openwakeword estiver instalado (evita conflito com speech_recognition)
+        if usar_wakeword:
+            try:
+                import openwakeword  # testa se esta instalado
+                self._iniciar_wakeword(picovoice_key)
+            except ImportError:
+                print("\033[33m[AUDIO]: openwakeword nao instalado — wake word desabilitada.")
+                print("  Para ativar: pip install openwakeword\033[0m")
+                self._wakeword = None
 
     # -----------------------------------------------------------------------
     # Setup
@@ -64,6 +127,27 @@ class SiriusAudio:
             engine.stop()
         except Exception:
             pass
+
+    def _iniciar_wakeword(self, picovoice_key: str = None):
+        """Inicializa detecção passiva de wake word."""
+        try:
+            from sirius_wakeword import SiriusWakeWord
+            self._wakeword = SiriusWakeWord(
+                callback_ativado=self._ao_detectar_wake_word
+            )
+            self._wakeword.iniciar()
+        except Exception as e:
+            print(f"\033[33m[AUDIO]: Wake word não disponível: {e}\033[0m")
+            self._wakeword = None
+
+    def _ao_detectar_wake_word(self):
+        """
+        Callback chamado pelo SiriusWakeWord quando detecta a wake word.
+        Sinaliza ao escutar_fluxo_continuo que o próximo áudio é um comando.
+        """
+        if not self._falando:
+            self._wake_ativada.set()
+            print("\033[94m[AUDIO]: Wake word detectada — aguardando comando...\033[0m")
 
     # -----------------------------------------------------------------------
     # Limpeza de texto
@@ -167,31 +251,39 @@ class SiriusAudio:
         return texto, tinha_wake_word
 
     def escutar_fluxo_continuo(self) -> str | None:
-        # ✅ Não escuta enquanto o Sirius estiver falando
+        # Não escuta enquanto o Sirius estiver falando
         if self._falando:
             time.sleep(0.1)
             return None
 
-        import speech_recognition as sr
+        # ── MODO WAKE WORD ATIVO ─────────────────────────────────────────
+        # A wake word já segura o microfone em loop próprio (pyaudio direto).
+        # NÃO abrimos outro stream aqui — só capturamos depois do beep.
+        if self._wakeword is not None and self._wakeword._rodando:
+            if not self._wake_ativada.is_set():
+                time.sleep(0.05)   # aguarda sem tocar no mic
+                return None
+            self._wake_ativada.clear()
+            return self._capturar_comando_pos_wakeword()
 
+        # ── SEM WAKE WORD: escuta contínua normal ────────────────────────
+        return self._escutar_sem_wakeword()
+
+    def _capturar_comando_pos_wakeword(self) -> str | None:
+        """Abre o mic UMA VEZ para capturar o comando após o beep da wake word."""
+        import speech_recognition as sr
         recognizer = sr.Recognizer()
         recognizer.energy_threshold = 300
-
         try:
-            microfone = sr.Microphone()
-            with microfone as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.3)
-
-                # ✅ Verifica novamente após calibração (fala pode ter começado)
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.2)
                 if self._falando:
                     return None
-
                 try:
-                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=8)
+                    audio = recognizer.listen(source, timeout=6, phrase_time_limit=10)
                 except sr.WaitTimeoutError:
                     return None
 
-            # ✅ Descarta áudio capturado se o Sirius começou a falar durante a escuta
             if self._falando:
                 return None
 
@@ -199,29 +291,71 @@ class SiriusAudio:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 f.write(wav_data)
                 tmp_path = f.name
-
             try:
                 segments, _ = self.model.transcribe(tmp_path, language="pt")
                 texto = "".join(s.text for s in segments).lower().strip()
             finally:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+                try: os.remove(tmp_path)
+                except: pass
 
-            if not texto:
+            if not texto or _eh_transcricao_ruim(texto):
                 return None
 
-            print(f"\033[90m[DEBUG AUDIO]: '{texto}'\033[0m")
-
-            texto, tinha_wake_word = self._normalizar_wake_word(texto)
-            if tinha_wake_word:
-                winsound.Beep(1000, 150)
-
+            print(f"\033[90m[DEBUG AUDIO]: (pos wakeword) '{texto}'\033[0m")
+            texto, tinha = self._normalizar_wake_word(texto)
+            if tinha:
+                winsound.Beep(1000, 100)
+            if "sirius" not in texto:
+                texto = f"sirius {texto}"
             return texto
 
         except (OSError, AttributeError):
-            print("\033[33m[SISTEMA]: Microfone não detectado ou ocupado. Retentando...\033[0m")
+            time.sleep(1)
+            return None
+        except Exception as e:
+            if "NoneType" not in str(e):
+                print(f"\033[31m[ERRO AUDIO]: {e}\033[0m")
+            return None
+
+    def _escutar_sem_wakeword(self) -> str | None:
+        """Escuta continua quando nao ha wake word ativa (fallback)."""
+        import speech_recognition as sr
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = 300
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                if self._falando:
+                    return None
+                try:
+                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=8)
+                except sr.WaitTimeoutError:
+                    return None
+
+            if self._falando:
+                return None
+
+            wav_data = audio.get_wav_data()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(wav_data)
+                tmp_path = f.name
+            try:
+                segments, _ = self.model.transcribe(tmp_path, language="pt")
+                texto = "".join(s.text for s in segments).lower().strip()
+            finally:
+                try: os.remove(tmp_path)
+                except: pass
+
+            if not texto or _eh_transcricao_ruim(texto):
+                return None
+
+            print(f"\033[90m[DEBUG AUDIO]: '{texto}'\033[0m")
+            texto, tinha = self._normalizar_wake_word(texto)
+            if tinha:
+                winsound.Beep(1000, 150)
+            return texto
+
+        except (OSError, AttributeError):
             time.sleep(1)
             return None
         except Exception as e:

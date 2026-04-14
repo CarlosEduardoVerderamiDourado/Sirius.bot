@@ -117,6 +117,30 @@ class FilaLeitor:
         if tema not in self._fila_descobertos and len(tema) > 5:
             self._fila_descobertos.append(tema)
 
+    _VERBOS_ACAO = {
+        "abre", "abrir", "fecha", "fechar", "manda", "mandar", "mande",
+        "envia", "enviar", "cria", "criar", "salva", "salvar", "desliga",
+        "desligar", "pesquise", "busque", "procure", "executa", "executar",
+        "liga", "ligar", "mostra", "mostrar", "toca", "tocar", "pausa",
+        "volume", "screenshot", "instala", "instalar",
+    }
+    _PERGUNTAS_CONTEXTO = {
+        "que horas", "que dia", "qual data", "como voce esta",
+        "tudo bem", "oi", "ola", "bom dia", "boa tarde", "boa noite",
+        "tchau", "flw", "valeu",
+    }
+
+    def _eh_tema_estudavel(self, pergunta: str) -> bool:
+        p         = pergunta.lower().strip()
+        primeira  = p.split()[0] if p.split() else ""
+        if primeira in self._VERBOS_ACAO:
+            return False
+        if any(ctx in p for ctx in self._PERGUNTAS_CONTEXTO):
+            return False
+        if len(p.split()) < 3:
+            return False
+        return True
+
     def puxar_perguntas_usuario(self):
         """Lê perguntas recentes do usuário do SQLite."""
         try:
@@ -132,6 +156,7 @@ class FilaLeitor:
                 pergunta = re.sub(r"\bsirius\b[,\s]*", "", pergunta).strip()
                 if (
                     len(pergunta) > 5
+                    and self._eh_tema_estudavel(pergunta)
                     and pergunta not in self._fila_usuario
                     and pergunta not in self._historico_recente
                 ):

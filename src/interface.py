@@ -276,6 +276,13 @@ class SiriusInterfaceMainWindow(QMainWindow):
         self.worker.status_fala.connect(self.set_fala_view)
         self.worker.start()
 
+        # Injeta callback de fala no proativo (para alertas falarem em voz)
+        if hasattr(self._cerebro, 'registrar_callback_fala'):
+            self._cerebro.registrar_callback_fala(self.worker.audio.falar)
+        # Injeta callback de log no proativo (para alertas aparecerem no chat)
+        if hasattr(self._cerebro, '_proativo') and self._cerebro._proativo:
+            self._cerebro._proativo._log = self.log_sirius
+
     def set_fala_view(self, status: bool):
         self.core_view.esta_falando = status
 

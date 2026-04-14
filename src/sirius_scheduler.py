@@ -150,6 +150,8 @@ class SiriusScheduler:
         try:
             duvida = self.cerebro.memoria.buscar_duvida_pendente()
             if duvida:
+                # FIX: marca como resolvida ANTES de processar — evita loop infinito
+                self.cerebro.memoria.marcar_duvida_como_resolvida(duvida)
                 print(f"\033[94m[SCHEDULER]: Processando dúvida pendente: '{duvida[:50]}'\033[0m")
                 threading.Thread(
                     target=self._agentes.pesquisar_e_aprender,
@@ -185,6 +187,7 @@ class SiriusScheduler:
                         f"\033[90m[SCHEDULER]: Standby após {tempo_inativo:.0f}s — "
                         f"aprendizado máximo ativado.\033[0m"
                     )
+                    _ciclo_treino = 0  # reseta ciclo ao entrar em standby
 
                 self._ciclos_standby += 1
                 _ciclo_treino        += 1

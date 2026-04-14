@@ -116,47 +116,47 @@ def _classificar_conteudo_mensagem(conector_e_conteudo):
 def _gerar_mensagem_sobre_tema(tema):
     """
     Gera um texto curto sobre o tema para enviar como mensagem.
-    Cascata: SiriusGerador -> embeddings/historico -> DuckDuckGo -> frase padrao
+    Cascata: AgentePesquisador (Wikipedia+DDG) -> DuckDuckGo direto -> frase padrao
+    O SiriusGerador NAO e usado aqui — ainda e fraco para gerar textos coerentes.
     """
-    # 1. Gerador seq2seq proprio
+    # 1. AgentePesquisador — Wikipedia PT + DuckDuckGo (mais confiavel que o gerador)
     try:
-        gerador = _get_gerador()
-        if gerador.esta_treinado():
-            resposta = gerador.gerar("me fala sobre {}".format(tema))
-            if resposta and len(resposta) > 15:
-                return resposta[:300].strip()
+        from sirius_agentes import AgentePesquisador
+        mem        = SiriusMemory()
+        pesquisador = AgentePesquisador(mem)
+        resultado  = pesquisador.executar(tema)
+        if resultado and len(resultado) > 30 and "nao encontrei" not in resultado.lower():
+            return resultado[:400].strip()
     except Exception:
         pass
 
-    # 2. Busca semantica no historico
+    # 2. DuckDuckGo direto
     try:
-        embeddings = _get_embeddings()
-        if embeddings.esta_treinado():
-            mem = SiriusMemory()
-            historico = mem.obter_historico_db(limit=50)
-            respostas = [c for role, c in historico if role == "assistant" and len(c) > 10]
-            if respostas:
-                similar = embeddings.buscar_mais_similar("sobre {}".format(tema), respostas)
-                if similar and len(similar) > 15:
-                    return similar[:300].strip()
-    except Exception:
-        pass
-
-    # 3. DuckDuckGo — pesquisa e extrai um resumo real
-    try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS() as ddgs:
             resultados = list(ddgs.text(tema, max_results=1))
         if resultados:
-            res = resultados[0]
+            res   = resultados[0]
             corpo = res.get("body", "") if isinstance(res, dict) else ""
             if corpo and len(corpo) > 20:
-                return corpo[:280].strip() + "..."
+                return corpo[:300].strip() + "..."
+    except Exception:
+        pass
+
+    # 3. Wikipedia direto
+    try:
+        import requests
+        url  = "https://pt.wikipedia.org/api/rest_v1/page/summary/" + tema.replace(" ", "_")
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 200:
+            extrato = resp.json().get("extract", "")
+            if extrato and len(extrato) > 30:
+                return extrato[:350].strip()
     except Exception:
         pass
 
     # 4. Frase padrao
-    return "Ei, pesquisei aqui sobre {} e e um tema bem interessante! Vale a pena dar uma olhada.".format(tema)
+    return "Ei, pesquisei aqui sobre {} e é um tema bem interessante! Vale a pena dar uma olhada.".format(tema)
 
 
 def _parsear_mensagem(texto):
@@ -282,19 +282,22 @@ def _gerar_conteudo_arquivo(tema, extensao):
         base = _TEMPLATES.get(extensao, "")
         return base + "# Tema: {}\n# TODO: implemente aqui\n".format(tema)
 
-    # Para .txt, .md — gera texto sobre o tema
+    # Para .txt, .md — usa AgentePesquisador em vez do gerador fraco
     try:
-        gerador = _get_gerador()
-        if gerador.esta_treinado():
-            resp = gerador.gerar("escreve sobre {}".format(tema))
-            if resp and len(resp) > 20:
-                return resp
+        from sirius_agentes import AgentePesquisador
+        mem        = SiriusMemory()
+        pesquisador = AgentePesquisador(mem)
+        resultado  = pesquisador.executar(tema)
+        if resultado and len(resultado) > 30 and "nao encontrei" not in resultado.lower():
+            if extensao == ".md":
+                return "# {}\n\n{}".format(tema.title(), resultado)
+            return resultado
     except Exception:
         pass
 
     # DuckDuckGo — busca conteudo real
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         with DDGS() as ddgs:
             resultados = list(ddgs.text(tema, max_results=3))
         if resultados:
@@ -631,6 +634,17 @@ def _classificar_intencao(texto, neuronio):
     if any(p in t for p in ["treina", "aprende", "evolui"]):
         return "treinar"
 
+    # Tempo real — hora e clima (interceptado antes do classificador no processar())
+    # Listado aqui para que o neuronio nao confunda com "conhecimento" e dispare agentes
+    _TEMPO_REAL_KW = {
+        "que horas", "que hora", "horas sao", "hora atual",
+        "que dia", "qual dia", "que data", "data de hoje",
+        "clima", "temperatura", "vai chover", "previsao", "chuva",
+        "faz frio", "faz calor", "ta frio", "ta quente",
+    }
+    if any(kw in t for kw in _TEMPO_REAL_KW):
+        return "tempo_real"
+
     # Mensagem — detecta antes de tudo
     tem_plataforma  = any(p in t for p in _PLATAFORMAS_MENSAGEM)
     tem_verbo_envio = any(p in t for p in ["manda", "mande", "envia", "envie",
@@ -663,8 +677,23 @@ def _classificar_intencao(texto, neuronio):
     except Exception:
         pass
 
-    if any(t.startswith(p) for p in ["o que e", "quem e", "como funciona",
-                                      "me fala", "explica", "conta sobre"]):
+    # Padrões de conhecimento — verifica em qualquer posição da frase
+    _TRIGGERS_CONHECIMENTO = {
+        "o que e", "oque e", "o que é", "oque é",
+        "que e ", "que é ",           # "que e pokemon", "que é anime"
+        "quem e", "quem é",
+        "como funciona", "como e ", "como é ",
+        "me fala", "me fale", "me conta", "me explica",
+        "explica ", "explique",
+        "conta sobre", "fala sobre",
+        "o que sao", "o que são",
+        "historia de", "história de", "historia do", "história do",
+        "o que foi", "o que são",
+        "what is", "tell me about",
+        "pra que serve", "para que serve",
+        "como se chama", "quais sao", "quais são",
+    }
+    if any(p in t for p in _TRIGGERS_CONHECIMENTO):
         return "conhecimento"
 
     return "conversa"
@@ -711,9 +740,15 @@ class SiriusCerebro:
         self.control  = SiriusControl()
 
         # --- Módulos opcionais (carregados lazy) ---
-        self._agentes   = None
-        self._scheduler = None
-        self._arquivos  = None
+        self._agentes    = None
+        self._scheduler  = None
+        self._arquivos   = None
+        self._proativo   = None
+        self._tempo_real = None
+
+        # --- Contexto de sessão em RAM (últimas N trocas) ---
+        self._contexto_sessao: list[dict] = []
+        self._MAX_CONTEXTO = 15
 
         self._inicializar_modulos()
         print("\033[92m[CEREBRO]: Cerebro 100% proprio inicializado.\033[0m")
@@ -746,6 +781,26 @@ class SiriusCerebro:
         except Exception as e:
             print(f"[CEREBRO]: Scheduler indisponível: {e}")
 
+        # Tempo real (hora, clima)
+        try:
+            from sirius_tempo_real import processar_tempo_real, _e_pergunta_tempo_real
+            self._tempo_real_fn        = processar_tempo_real
+            self._e_tempo_real_fn      = _e_pergunta_tempo_real
+            print("\033[92m[CEREBRO]: Módulo de tempo real ativado.\033[0m")
+        except Exception as e:
+            self._tempo_real_fn   = None
+            self._e_tempo_real_fn = None
+            print(f"[CEREBRO]: Tempo real indisponível: {e}")
+
+        # Proativo (lembretes e alertas)
+        try:
+            from sirius_proativo import SiriusProativo
+            self._proativo = SiriusProativo()
+            self._proativo.iniciar()
+            print("\033[92m[CEREBRO]: Sistema proativo ativado.\033[0m")
+        except Exception as e:
+            print(f"[CEREBRO]: Proativo indisponível: {e}")
+
     def _registrar_scheduler(self, coordenador, treinador):
         """Chamado pelo main após inicializar coordenador e treinador."""
         if self._scheduler:
@@ -765,12 +820,51 @@ class SiriusCerebro:
     def _eh_falha(self, texto):
         return any(ind in texto.lower() for ind in INDICADORES_FALHA)
 
+    def _filtrar_resposta_agente(self, resposta: str) -> str | None:
+        """
+        Filtra respostas cruas dos agentes:
+        - Remove prefixos de fonte ([Web], [Wikipedia])
+        - Descarta respostas muito curtas ou claramente em ingles sem contexto
+        - Encurta para no maximo 400 chars para manter conversa fluida
+        """
+        if not resposta or len(resposta) < 15:
+            return None
+
+        # Remove prefixos de fonte
+        import re as _re
+        resposta = _re.sub(r"^\[(?:Web|Wikipedia|Fonte)\]\s*", "", resposta).strip()
+
+        # Se resposta e muito longa, pega so o primeiro paragrafo util
+        if len(resposta) > 400:
+            # Tenta achar primeiro ponto final apos 150 chars
+            idx = resposta.find(".", 150)
+            if 150 < idx < 400:
+                resposta = resposta[:idx + 1].strip()
+            else:
+                resposta = resposta[:397].strip() + "..."
+
+        # Detecta se e principalmente ingles (heuristica simples)
+        # Palavras comuns em ingles que raramente aparecem em pt-BR
+        palavras_en = {"the", "is", "are", "was", "were", "has", "have",
+                       "this", "that", "with", "from", "they", "their",
+                       "which", "also", "been", "will", "would", "could"}
+        palavras = set(resposta.lower().split())
+        n_en = len(palavras & palavras_en)
+        total = len(palavras)
+        if total > 5 and n_en / total > 0.18:
+            # Mais de 18% das palavras sao ingles — descarta, nao responde em ingles
+            print(f"[CEREBRO]: Resposta em ingles descartada ({n_en}/{total} palavras EN)")
+            return None
+
+        return resposta
+
     def _tentar_agentes(self, comando: str) -> str | None:
         """Tenta resolver o comando usando os agentes especializados."""
         if not self._agentes:
             return None
         try:
-            return self._agentes.executar(comando)
+            resposta = self._agentes.executar(comando)
+            return self._filtrar_resposta_agente(resposta)
         except Exception as e:
             print(f"[CEREBRO]: Agente falhou: {e}")
             return None
@@ -791,12 +885,60 @@ class SiriusCerebro:
             print(f"[CEREBRO]: Erro ao ler arquivo: {e}")
             return None
 
+    def _adicionar_contexto(self, role: str, content: str):
+        """Adiciona mensagem ao contexto de sessão em RAM."""
+        self._contexto_sessao.append({"role": role, "content": content})
+        # Mantém apenas as últimas _MAX_CONTEXTO trocas (user+assistant = 2 itens por troca)
+        if len(self._contexto_sessao) > self._MAX_CONTEXTO * 2:
+            self._contexto_sessao = self._contexto_sessao[-(self._MAX_CONTEXTO * 2):]
+
+    def _contexto_para_texto(self) -> str:
+        """Converte o histórico de sessão em texto para dar contexto ao agente."""
+        if not self._contexto_sessao:
+            return ""
+        linhas = []
+        for msg in self._contexto_sessao[-10:]:  # últimas 10 mensagens
+            prefixo = "Você" if msg["role"] == "user" else "Sirius"
+            linhas.append(f"{prefixo}: {msg['content']}")
+        return "\n".join(linhas)
+
+    def _e_referencia_contextual(self, texto: str) -> bool:
+        """Detecta se a mensagem faz referência ao contexto anterior."""
+        t = texto.lower()
+        return any(p in t for p in [
+            "isso", "esse", "essa", "aquilo", "ele", "ela",
+            "o que disse", "o que falou", "antes", "anterior",
+            "me explica mais", "mais sobre isso", "continua",
+            "e sobre", "e esse", "e ela", "e ele",
+        ])
+
+    def registrar_callback_fala(self, callback_falar):
+        """Injeta o callback de fala no módulo proativo (chamado pelo main/interface)."""
+        if self._proativo:
+            self._proativo._falar = callback_falar
+
     def processar(self, texto_usuario, forcar_processamento=False):
         if isinstance(texto_usuario, list):
             texto_usuario = texto_usuario[0] if texto_usuario else ""
         texto_lower = str(texto_usuario).lower().strip()
 
         if not texto_lower:
+            return None
+
+        # Descarta transcrições ruins (eco, repetição, ruído do microfone)
+        from collections import Counter as _Counter
+        import re as _re
+        palavras = texto_lower.split()
+        _ruim = False
+        if len(palavras) >= 4:
+            freq = _Counter(palavras)
+            if freq.most_common(1)[0][1] / len(palavras) > 0.5:
+                _ruim = True
+        sentencas = [s.strip() for s in _re.split(r'[.!?]', texto_lower) if len(s.strip()) > 3]
+        if len(sentencas) >= 2 and len(set(sentencas)) < len(sentencas) * 0.6:
+            _ruim = True
+        if _ruim:
+            print(f"\033[90m[CEREBRO]: Descartado (ruido): '{texto_lower[:40]}'\033[0m")
             return None
 
         if "sirius" in texto_lower:
@@ -812,11 +954,34 @@ class SiriusCerebro:
         if self._scheduler:
             self._scheduler.registrar_atividade()
 
+        # Adiciona ao contexto de sessão
+        self._adicionar_contexto("user", comando)
+
         # Resposta rápida instantânea
         resp_rapida = self._resposta_rapida(comando)
         if resp_rapida:
+            self._adicionar_contexto("assistant", resp_rapida)
             self.memoria.salvar_historico(comando, resp_rapida)
             return resp_rapida
+
+        # --- TEMPO REAL (hora / clima) — antes do classificador ---
+        try:
+            from sirius_tempo_real import processar_tempo_real
+            resp_tempo = processar_tempo_real(comando)
+            if resp_tempo:
+                self._adicionar_contexto("assistant", resp_tempo)
+                self.memoria.salvar_historico(comando, resp_tempo)
+                return resp_tempo
+        except Exception as e:
+            print("[CEREBRO]: sirius_tempo_real falhou: {}".format(e))
+
+        # --- PROATIVO (lembretes) ---
+        if self._proativo and self._proativo.e_comando_proativo(comando):
+            resp_proativo = self._proativo.processar_comando(comando)
+            if resp_proativo:
+                self._adicionar_contexto("assistant", resp_proativo)
+                self.memoria.salvar_historico(comando, resp_proativo)
+                return resp_proativo
 
         print("[CEREBRO]: Classificando: '{}'".format(comando))
         intencao = _classificar_intencao(comando, self.neuronio)
@@ -833,54 +998,73 @@ class SiriusCerebro:
         # --- Arquivo mencionado? ---
         resposta_arquivo = self._tentar_ler_arquivo(comando)
         if resposta_arquivo:
+            self._adicionar_contexto("assistant", resposta_arquivo)
             self.memoria.salvar_historico(comando, resposta_arquivo)
             return resposta_arquivo
+
+        # --- Enriquece o comando com contexto se for referência ---
+        # Ex: "e esse?" após "que e pokemon" → "e esse pokemon?"
+        if self._e_referencia_contextual(comando) and self._contexto_sessao:
+            ctx = self._contexto_para_texto()
+            comando_enriquecido = f"[Contexto da conversa:\n{ctx}\n]\n{comando}"
+        else:
+            comando_enriquecido = comando
 
         # --- Controle do PC (acao) ---
         if intencao == "acao":
             resposta = _parsear_controle_pc(comando, self.control)
 
-            # Se o controle_pc não resolveu, tenta os agentes
             if resposta is None:
                 resposta = self._tentar_agentes(comando)
 
             if resposta is None:
                 resposta = (
                     "Entendi que voce quer fazer algo, mas nao consegui identificar o que. "
-                    "Exemplos: 'abre o chrome', 'lê o arquivo doc.pdf', "
+                    "Exemplos: 'abre o chrome', 'le o arquivo doc.pdf', "
                     "'manda mensagem para Joao no discord falando oi'."
                 )
+            self._adicionar_contexto("assistant", resposta)
             self.memoria.salvar_historico(comando, resposta)
             self.memoria.salvar_amostra_treino(comando, resposta)
             return resposta
 
         # --- Agentes para conhecimento ---
-        resposta_agente = self._tentar_agentes(comando)
+        resposta_agente = self._tentar_agentes(comando_enriquecido)
         if resposta_agente and not self._eh_falha(resposta_agente):
             resposta_final = self.filtro.aplicar_zoeira(resposta_agente)
+            self._adicionar_contexto("assistant", resposta_final)
             self.memoria.salvar_historico(comando, resposta_final)
             self.memoria.salvar_amostra_treino(comando, resposta_agente)
             return resposta_final
 
         # --- Conhecimento / conversa (gerador + embeddings) ---
-        resposta_ia = _responder_conhecimento(comando, self.memoria)
+        resposta_ia = _responder_conhecimento(comando_enriquecido, self.memoria)
 
         if resposta_ia and not self._eh_falha(resposta_ia):
             resposta_final = self.filtro.aplicar_zoeira(resposta_ia)
         else:
-            self.memoria.adicionar_duvida(comando)
-            # Dispara pesquisa em background pelo agente pesquisador
-            if self._agentes:
-                threading.Thread(
-                    target=self._agentes.pesquisar_e_aprender,
-                    args=(comando,),
-                    daemon=True
-                ).start()
+            _nao_estudavel = any(p in comando for p in [
+                "que horas", "que dia", "qual data", "tudo bem", "como voce",
+                "bom dia", "boa tarde", "boa noite", "tchau", "valeu", "flw",
+            ]) or any(comando.startswith(v) for v in [
+                "abre ", "abrir ", "fecha ", "manda ", "mande ", "envia ",
+                "cria ", "desliga ", "executa ", "liga ", "mostra ", "volume",
+            ])
+            if not _nao_estudavel:
+                self.memoria.adicionar_duvida(comando)
+                if self._agentes:
+                    threading.Thread(
+                        target=self._agentes.pesquisar_e_aprender,
+                        args=(comando,),
+                        daemon=True
+                    ).start()
             resposta_final = (
-                "Mano, ainda nao sei responder isso direito. "
-                "Ja anotei pra estudar e melhorar!"
+                "Mano, ainda nao sei responder isso bem. "
+                "Ja anotei e vou pesquisar mais sobre isso. "
+                "Me faz essa pergunta de novo daqui a pouco!"
             )
 
+        self._adicionar_contexto("assistant", resposta_final)
         self.memoria.salvar_historico(comando, resposta_final)
         if resposta_ia:
             self.memoria.salvar_amostra_treino(comando, resposta_ia)
