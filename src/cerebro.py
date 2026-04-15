@@ -569,13 +569,34 @@ def _parsear_controle_pc(texto, control):
                 return control.pressionar_tecla(tecla)
 
     # -----------------------------------------------------------------------
-    # 12. SISTEMA
+    # 12. SISTEMA — status de CPU, RAM, disco e processos
+    # Cobre todas as formas naturais de perguntar sobre o sistema
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["cpu", "ram", "uso do sistema", "recursos do pc"]):
+    _TRIGGERS_STATUS_SISTEMA = {
+        # CPU/RAM direto
+        "cpu", "ram", "memoria ram",
+        # Frases naturais de status
+        "uso do sistema", "recursos do pc", "como ta o sistema",
+        "como esta o sistema", "como anda o sistema", "status do sistema",
+        "como ta o pc", "como esta o pc", "como anda o pc",
+        "como ta o computador", "como esta o computador",
+        "ta pesado", "esta pesado", "ta lento", "esta lento",
+        "quanto ta usando", "quanto esta usando",
+        "ta travando", "esta travando", "travando muito",
+        "bateria", "memoria livre", "espaco livre",
+        "consumo de cpu", "consumo de ram", "consumo de memoria",
+        "desempenho do pc", "performance do pc",
+    }
+    if any(p in t for p in _TRIGGERS_STATUS_SISTEMA):
         return control.uso_cpu_ram()
-    if any(p in t for p in ["processos ativos", "o que esta rodando"]):
+
+    if any(p in t for p in ["processos ativos", "o que esta rodando",
+                              "quais processos", "top processos"]):
         return control.processos_ativos()
-    if any(p in t for p in ["info do sistema", "sistema operacional"]):
+
+    if any(p in t for p in ["info do sistema", "sistema operacional",
+                              "qual windows", "versao do windows",
+                              "informacoes do sistema"]):
         return control.info_sistema()
 
     # -----------------------------------------------------------------------
@@ -626,6 +647,19 @@ _TRIGGERS_CONTROLE = {
     "volume", "audio", "som", "musica", "faixa",
     "cpu", "ram", "processos",
     "cria", "crie", "criar", "gera", "gere", "gerar",
+    # Status do sistema — precisam ser acao, nao conversa
+    "bateria", "memoria",
+}
+
+# Frases compostas de status do sistema (verificadas separadamente no classificador)
+_TRIGGERS_SISTEMA_FRASES = {
+    "uso do sistema", "recursos do pc",
+    "como ta o sistema", "como esta o sistema", "como anda o sistema",
+    "status do sistema", "como ta o pc", "como esta o pc",
+    "como ta o computador", "ta pesado", "esta pesado",
+    "ta lento", "esta lento", "quanto ta usando",
+    "ta travando", "esta travando", "consumo de cpu", "consumo de ram",
+    "desempenho do pc", "performance do pc", "espaco livre",
 }
 
 def _classificar_intencao(texto, neuronio):
@@ -658,6 +692,11 @@ def _classificar_intencao(texto, neuronio):
             return "acao"
         if any(p in t for p in ["arquivo", "file", "documento"]):
             return "acao"
+
+    # Frases compostas de sistema — verificadas antes dos triggers individuais
+    # Evita que "como ta o sistema" vire pesquisa de conhecimento sobre "sistema"
+    if any(frase in t for frase in _TRIGGERS_SISTEMA_FRASES):
+        return "acao"
 
     # Triggers diretos (verifica palavra inteira)
     palavras = set(t.split())
@@ -704,26 +743,66 @@ def _classificar_intencao(texto, neuronio):
 # ---------------------------------------------------------------------------
 
 def _responder_conhecimento(texto, memoria):
+    """
+    Cascata de respostas — da mais confiável para a menos:
+    1. AgentePesquisador (Wikipedia + DDG) — sempre disponível, resposta real
+    2. Embeddings + histórico — busca semântica no que já foi respondido
+    3. SiriusGerador — só usado se tiver dados suficientes E resposta longa o bastante
+    """
+    # 1. AgentePesquisador — fonte mais confiável para perguntas de conhecimento
+    # Evita usar o gerador que ainda é fraco
     try:
-        gerador = _get_gerador()
-        if gerador.esta_treinado():
-            resposta = gerador.gerar(texto)
-            if resposta and len(resposta) > 5:
-                return resposta
+        from sirius_agentes import AgentePesquisador
+        pesquisador = AgentePesquisador(memoria)
+        resultado   = pesquisador.executar(texto)
+        if resultado and len(resultado) > 40 and "nao encontrei" not in resultado.lower():
+            return resultado
     except Exception as e:
-        print("[CEREBRO]: Gerador falhou: {}".format(e))
+        print("[CEREBRO]: AgentePesquisador falhou: {}".format(e))
 
+    # 2. Busca semântica no histórico
     try:
         embeddings = _get_embeddings()
         if embeddings.esta_treinado():
-            historico = memoria.obter_historico_db(limit=50)
-            respostas = [c for role, c in historico if role == "assistant" and len(c) > 10]
+            historico  = memoria.obter_historico_db(limit=50)
+            respostas  = [
+                cont for role, cont in historico
+                if role == "assistant" and len(cont) > 20
+                # Filtra respostas que são do gerador fraco (contêm frases repetidas)
+                and cont.count("mano") < 3
+                and "motor local tá fora" not in cont
+            ]
             if respostas:
                 similar = embeddings.buscar_mais_similar(texto, respostas)
-                if similar:
+                if similar and len(similar) > 20:
                     return similar
     except Exception as e:
         print("[CEREBRO]: Busca semantica falhou: {}".format(e))
+
+    # 3. SiriusGerador — só usa se tiver dados suficientes
+    # Com poucos dados o gerador memoriza e repete, gerando lixo
+    try:
+        import sqlite3, os
+        db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "data", "sirius_pessoal.db")
+        conn = sqlite3.connect(db)
+        n_conversas = conn.execute("SELECT COUNT(*) FROM conversas").fetchone()[0]
+        conn.close()
+
+        if n_conversas >= 300:  # só usa o gerador com dados suficientes
+            gerador = _get_gerador()
+            if gerador.esta_treinado():
+                resposta = gerador.gerar(texto)
+                # Valida qualidade — descarta resposta com repetição
+                if resposta and len(resposta) > 20:
+                    palavras = resposta.split()
+                    from collections import Counter
+                    freq = Counter(palavras)
+                    mais_freq = freq.most_common(1)[0][1] if palavras else 0
+                    if mais_freq / max(len(palavras), 1) < 0.3:  # menos de 30% repetição
+                        return resposta
+    except Exception as e:
+        print("[CEREBRO]: Gerador falhou: {}".format(e))
 
     return None
 
@@ -916,6 +995,14 @@ class SiriusCerebro:
         """Injeta o callback de fala no módulo proativo (chamado pelo main/interface)."""
         if self._proativo:
             self._proativo._falar = callback_falar
+
+    def registrar_callback(self, callback_falar=None, callback_log=None):
+        """Alias compatível com a assinatura do sirius_proativo.registrar_callback."""
+        if self._proativo:
+            self._proativo.registrar_callback(
+                callback_falar=callback_falar,
+                callback_log=callback_log
+            )
 
     def processar(self, texto_usuario, forcar_processamento=False):
         if isinstance(texto_usuario, list):

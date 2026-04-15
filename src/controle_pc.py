@@ -694,16 +694,58 @@ class SiriusControl:
             return "Erro: " + str(e)
 
     def uso_cpu_ram(self):
+        """
+        Retorna status completo do sistema:
+        CPU | RAM | Disco livre | Bateria (se notebook)
+        Responde a: "como ta o sistema", "cpu", "ram", "ta pesado", etc.
+        """
         try:
             import psutil
+
             cpu = psutil.cpu_percent(interval=0.5)
             ram = psutil.virtual_memory()
-            return "CPU: {:.1f}%\nRAM: {:.1f}% ({} MB / {} MB)".format(
-                cpu, ram.percent, ram.used//1024**2, ram.total//1024**2)
+
+            # Disco — pasta do usuario
+            try:
+                disco = psutil.disk_usage(os.path.expanduser("~"))
+                disco_livre_gb = disco.free // (1024 ** 3)
+                disco_str = " | Disco: {} GB livres".format(disco_livre_gb)
+            except Exception:
+                disco_str = ""
+
+            # Bateria — so se for notebook
+            try:
+                bat = psutil.sensors_battery()
+                if bat is not None:
+                    carregando = " (carregando)" if bat.power_plugged else ""
+                    bat_str = " | Bateria: {:.0f}%{}".format(bat.percent, carregando)
+                else:
+                    bat_str = ""
+            except Exception:
+                bat_str = ""
+
+            # Monta resposta amigavel
+            ram_usada_gb  = ram.used  // (1024 ** 2)
+            ram_total_gb  = ram.total // (1024 ** 2)
+            ram_pct       = ram.percent
+
+            # Avaliacao do estado geral
+            if cpu > 80 or ram_pct > 85:
+                estado = "Ta pesado, chefia!"
+            elif cpu > 50 or ram_pct > 60:
+                estado = "Ta moderado."
+            else:
+                estado = "Ta tranquilo."
+
+            return "CPU: {:.0f}% | RAM: {:.0f}% ({} / {} MB){}{} — {}".format(
+                cpu, ram_pct, ram_usada_gb, ram_total_gb,
+                disco_str, bat_str, estado
+            )
+
         except ImportError:
-            return "Instale psutil: pip install psutil"
+            return "psutil nao instalado. Rode: pip install psutil"
         except Exception as e:
-            return "Erro: " + str(e)
+            return "Erro ao checar sistema: " + str(e)
 
     def processos_ativos(self, top_n=10):
         try:
