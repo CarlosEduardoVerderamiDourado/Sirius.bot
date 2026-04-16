@@ -43,49 +43,56 @@ class SiriusWorker(QThread):
     def run(self):
         print("\033[94m[WORKER]: Núcleo de processamento ativo.\033[0m")
         while self.rodando:
-            fala_usuario = None
+            try:
+                fala_usuario = None
 
-            # Prioridade 1: Texto manual
-            with self.lock:
-                if self.comando_manual:
-                    fala_usuario        = self.comando_manual
-                    self.comando_manual = None
+                # Prioridade 1: Texto manual
+                with self.lock:
+                    if self.comando_manual:
+                        fala_usuario        = self.comando_manual
+                        self.comando_manual = None
 
-            # Prioridade 2: Voz
-            if not fala_usuario and self.modo_voz_ativo:
-                try:
-                    resultado_voz = self.audio.escutar_fluxo_continuo()
-                    if resultado_voz:
-                        fala_usuario = resultado_voz
-                except Exception as e:
-                    print(f"[ERRO ÁUDIO]: {e}")
-                    time.sleep(1)
-                    continue
-
-            if fala_usuario:
-                comando_str = str(fala_usuario).strip()
-                if not comando_str:
-                    time.sleep(0.01)
-                    continue
-
-                self.comando_detectado.emit(comando_str)
-
-                # ✅ FIX: forcar_processamento quando não há wake word
-                tem_wake_word = "sirius" in comando_str.lower()
-                resposta = self.cerebro.processar(
-                    comando_str,
-                    forcar_processamento=not tem_wake_word
-                )
-
-                if resposta:
-                    self.resposta_pronta.emit(str(resposta))
-                    self.status_fala.emit(True)
+                # Prioridade 2: Voz
+                if not fala_usuario and self.modo_voz_ativo:
                     try:
-                        self.audio.falar(resposta)
-                    finally:
-                        self.status_fala.emit(False)
+                        resultado_voz = self.audio.escutar_fluxo_continuo()
+                        if resultado_voz:
+                            fala_usuario = resultado_voz
+                    except Exception as e:
+                        print(f"[ERRO ÁUDIO]: {e}")
+                        time.sleep(1)
+                        continue
 
-            time.sleep(0.01)
+                if fala_usuario:
+                    comando_str = str(fala_usuario).strip()
+                    if not comando_str:
+                        time.sleep(0.01)
+                        continue
+
+                    self.comando_detectado.emit(comando_str)
+
+                    tem_wake_word = "sirius" in comando_str.lower()
+                    resposta = self.cerebro.processar(
+                        comando_str,
+                        forcar_processamento=not tem_wake_word
+                    )
+
+                    if resposta:
+                        self.resposta_pronta.emit(str(resposta))
+                        self.status_fala.emit(True)
+                        try:
+                            self.audio.falar(resposta)
+                        except Exception as e:
+                            print(f"[WORKER]: Erro ao falar: {e}")
+                        finally:
+                            self.status_fala.emit(False)
+
+                time.sleep(0.01)
+
+            except Exception as e:
+                # Captura qualquer exceção inesperada para não derrubar o worker
+                print(f"\033[31m[WORKER]: Erro inesperado (recuperando): {type(e).__name__}: {e}\033[0m")
+                time.sleep(1)  # pausa antes de tentar de novo
 
     def parar(self):
         self.rodando = False

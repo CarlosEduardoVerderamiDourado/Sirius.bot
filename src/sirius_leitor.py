@@ -270,13 +270,15 @@ class ExtratorTexto:
 
     def extrair_de_screenshot(self, imagem_path: str) -> str:
         """
-        PONTO DE EXTENSÃO — visão computacional futura.
-
-        Quando SiriusVisao estiver pronto:
-            from sirius_visao import SiriusVisao
-            return SiriusVisao().ler_texto(imagem_path)
+        Extrai texto de screenshot usando SiriusVisao (OCR).
+        Ponto de extensão — agora implementado.
         """
-        return ""  # TODO: implementar com SiriusVisao
+        try:
+            from sirius_visao import get_visao
+            return get_visao().ler_texto(imagem_path)
+        except Exception as e:
+            print(f"[LEITOR]: SiriusVisao falhou no OCR: {e}")
+            return ""
 
     def _limpar(self, texto: str) -> str:
         texto  = re.sub(r"\s{2,}", " ", texto)

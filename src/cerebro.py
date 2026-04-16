@@ -385,8 +385,23 @@ def _parsear_criar_arquivo(texto):
 # Parser principal de controle do PC
 # ---------------------------------------------------------------------------
 
+def _normalizar(texto):
+    """
+    Remove acentos, normaliza espacos e converte para minusculo.
+    Garante que "músíca", "musica", "musica" etc. todos funcionem.
+    """
+    import unicodedata
+    t = unicodedata.normalize("NFD", texto.lower().strip())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    # Normaliza espacos multiplos
+    t = " ".join(t.split())
+    return t
+
+
 def _parsear_controle_pc(texto, control):
-    t = texto.lower().strip()
+    # t = versao normalizada (sem acentos, minusculo)
+    # texto = original preservado para extrair nomes/conteudos
+    t = _normalizar(texto)
 
     # -----------------------------------------------------------------------
     # 1. MENSAGENS — prioridade maxima
@@ -436,62 +451,142 @@ def _parsear_controle_pc(texto, control):
 
     # -----------------------------------------------------------------------
     # 3. ENERGIA
+    # Aceita: com/sem acento, formal/informal, voz/texto
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["desliga", "desligar", "shutdown"]):
-        if any(p in t for p in ["cancela", "cancelar", "abort"]):
+    _DESLIGAR = {
+        "desliga", "desligar", "desligue", "shutdown", "desligar o pc",
+        "desliga o pc", "desligar o computador", "desliga o computador",
+        "apaga o pc", "apagar o pc", "apaga o computador",
+    }
+    _CANCELAR_ENERGIA = {
+        "cancela", "cancelar", "cancele", "abort", "cancela desligar",
+        "nao desliga", "nao desligue", "para desligar",
+    }
+    if any(p in t for p in _DESLIGAR):
+        if any(p in t for p in _CANCELAR_ENERGIA):
             return control.gerenciar_energia("cancelar")
         return control.gerenciar_energia("desligar")
 
-    if any(p in t for p in ["reinicia", "reiniciar", "restart", "reboot"]):
+    if any(p in t for p in {
+        "reinicia", "reiniciar", "reinicie", "restart", "reboot",
+        "reiniciar o pc", "reinicia o pc", "reiniciar o computador",
+        "reinicia o computador", "reiniciar computador", "dar um restart",
+    }):
         return control.gerenciar_energia("reiniciar")
 
-    if any(p in t for p in ["suspende", "suspender", "sleep", "dormir"]):
+    if any(p in t for p in {
+        "suspende", "suspender", "suspenda", "sleep", "dormir", "modo sleep",
+        "modo descanso", "suspender o pc", "modo hibernacao", "colocar pra dormir",
+    }):
         return control.gerenciar_energia("suspender")
 
-    if any(p in t for p in ["hiberna", "hibernar", "hibernate"]):
+    if any(p in t for p in {
+        "hiberna", "hibernar", "hibernate", "modo hibernar",
+    }):
         return control.gerenciar_energia("hibernar")
 
-    if any(p in t for p in ["bloqueia", "bloquear", "travar tela", "lock"]):
+    if any(p in t for p in {
+        "bloqueia", "bloquear", "bloqueie", "travar tela", "travar o pc",
+        "lock", "bloquear tela", "bloquear o computador", "bloqueia a tela",
+        "tranca o pc", "tranca a tela",
+    }):
         return control.gerenciar_energia("bloquear")
 
     # -----------------------------------------------------------------------
     # 4. VOLUME E MIDIA
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["volume", "som", "audio"]):
-        if any(p in t for p in ["mais", "aumenta", "sobe"]):
+    _TEM_VOLUME = {"volume", "som", "audio", "musica", "midia"}
+    if any(p in t for p in _TEM_VOLUME):
+        if any(p in t for p in {
+            "mais", "aumenta", "aumentar", "sobe", "subir", "alto",
+            "mais alto", "coloca mais", "deixa mais alto", "up",
+        }):
             return control.controle_hardware("volume_mais", _extrair_numero(t, 3))
-        if any(p in t for p in ["menos", "diminui", "baixa"]):
+        if any(p in t for p in {
+            "menos", "diminui", "diminuir", "baixa", "baixar", "baixo",
+            "mais baixo", "coloca menos", "deixa mais baixo", "down",
+        }):
             return control.controle_hardware("volume_menos", _extrair_numero(t, 3))
-        if any(p in t for p in ["muta", "silencia", "mute"]):
+        if any(p in t for p in {
+            "muta", "mutar", "mute", "silencia", "silenciar", "silencio",
+            "cala", "tirar o som", "desligar o som", "sem som",
+        }):
             return control.controle_hardware("mutar")
 
-    if any(p in t for p in ["proxima musica", "pula musica", "next track"]):
+    if any(p in t for p in {
+        "proxima musica", "proxima faixa", "pula musica", "pula faixa",
+        "next track", "proxima", "pula essa", "passa essa", "pular musica",
+        "avancar musica", "proximo", "skip",
+    }):
         return control.controle_hardware("proxima_musica")
-    if any(p in t for p in ["musica anterior", "faixa anterior"]):
+
+    if any(p in t for p in {
+        "musica anterior", "faixa anterior", "volta musica", "volta faixa",
+        "prev track", "anterior", "voltai musica", "musica de antes",
+    }):
         return control.controle_hardware("musica_anterior")
-    if any(p in t for p in ["pausa", "pausar", "pause", "play"]):
-        if any(p in t for p in ["musica", "audio", "video"]):
+
+    if any(p in t for p in {
+        "pausa", "pausar", "pause", "play", "continua", "continuar",
+        "para a musica", "continua a musica", "toca", "tocar",
+        "retomar", "retoma",
+    }):
+        if any(p in t for p in {"musica", "audio", "video", "midia", "reproducao"}):
             return control.controle_hardware("pausar_musica")
 
     # -----------------------------------------------------------------------
-    # 5. SCREENSHOT
+    # 5. VISAO — analisa o que está na tela
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["screenshot", "print screen", "printscreen",
-                              "tira print", "tirar print", "captura de tela"]):
+    _TRIGGERS_VISAO = {
+        "o que tem na tela", "o que esta na tela", "o que ta na tela",
+        "leia a tela", "le a tela", "ler a tela", "leia o que esta",
+        "analisa a tela", "analise a tela", "descreve a tela",
+        "o que diz na tela", "o que esta escrito na tela",
+        "o que voce ve", "ve a tela", "olha a tela",
+        "qual e o erro na tela", "qual erro aparece",
+        "o que tem aberto", "o que aparece na tela",
+        "descreve o que ve",
+    }
+    if any(p in t for p in _TRIGGERS_VISAO):
+        try:
+            from sirius_visao import get_visao
+            visao    = get_visao()
+            resposta = visao.analisar_tela(t)
+            return resposta
+        except Exception as e:
+            return f"Nao consegui analisar a tela: {e}. Instale: pip install pyautogui Pillow pytesseract"
+
+    # 5b. SCREENSHOT (só tira print, sem análise)
+    # -----------------------------------------------------------------------
+    if any(p in t for p in {
+        "screenshot", "print screen", "printscreen",
+        "tira print", "tirar print", "tira screenshot", "tirar screenshot",
+        "captura de tela", "capturar tela", "foto da tela", "foto do monitor",
+        "salva a tela", "salvar tela", "registra a tela",
+    }):
         return control.screenshot(_extrair_entre_aspas(t) or "")
 
     # -----------------------------------------------------------------------
     # 6. ABRIR
     # -----------------------------------------------------------------------
-    for gatilho in ["abre ", "abrir ", "abra ", "executa ", "executar ",
-                     "inicia ", "iniciar ", "roda ", "rodar ",
-                     "abre o ", "abre a ", "abrir o ", "abrir a "]:
+    _GATILHOS_ABRIR = {
+        "abre ", "abrir ", "abra ", "executa ", "executar ",
+        "inicia ", "iniciar ", "roda ", "rodar ",
+        "abre o ", "abre a ", "abrir o ", "abrir a ",
+        "lanca ", "lancar ", "abre esse ", "abrir esse ",
+        "iniciar o ", "iniciar a ", "inicializa ", "inicializar ",
+        "carrega ", "carregar ", "abre pra mim ", "abre ai ",
+    }
+    for gatilho in _GATILHOS_ABRIR:
         if gatilho in t:
             resto = t.split(gatilho, 1)[1].strip()
-            for nome_pasta in ["documentos","desktop","downloads","imagens","musicas","videos"]:
+            for nome_pasta in {
+                "documentos", "desktop", "downloads", "imagens",
+                "musicas", "videos", "area de trabalho",
+            }:
                 if nome_pasta in resto:
                     return control.abrir_pasta(nome_pasta)
-            if any(p in resto for p in ["http", "www.", ".com", ".br", ".org"]):
+            if any(p in resto for p in ["http", "www.", ".com", ".br", ".org", ".io"]):
                 return control.abrir_url(resto.split()[0])
             nome = resto.split()[0] if resto else ""
             if nome:
@@ -504,8 +599,14 @@ def _parsear_controle_pc(texto, control):
     # -----------------------------------------------------------------------
     # 7. FECHAR
     # -----------------------------------------------------------------------
-    for gatilho in ["fecha ", "fechar ", "feche ", "encerra ", "encerrar ",
-                     "fecha o ", "fecha a "]:
+    _GATILHOS_FECHAR = {
+        "fecha ", "fechar ", "feche ", "encerra ", "encerrar ",
+        "fecha o ", "fecha a ", "fechar o ", "fechar a ",
+        "mata ", "matar ", "kill ", "mata o ", "matar o ",
+        "para o ", "parar o ", "fecha esse ", "encerrar o ",
+        "fecha isso ", "fecha ai ",
+    }
+    for gatilho in _GATILHOS_FECHAR:
         if gatilho in t:
             nome = t.split(gatilho, 1)[1].strip().split()[0]
             if nome:
@@ -514,40 +615,73 @@ def _parsear_controle_pc(texto, control):
     # -----------------------------------------------------------------------
     # 8. JANELAS
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["minimiza", "minimizar"]):
-        nome = _extrair_nome_app(t, ["minimiza", "minimizar"])
+    if any(p in t for p in {
+        "minimiza", "minimizar", "minimize", "minimiza a janela",
+        "minimizar a janela", "esconde a janela", "reduz a janela",
+    }):
+        nome = _extrair_nome_app(t, ["minimiza", "minimizar", "minimize"])
         return control.minimizar_janela(nome or "")
 
-    if any(p in t for p in ["maximiza", "maximizar"]):
-        nome = _extrair_nome_app(t, ["maximiza", "maximizar"])
+    if any(p in t for p in {
+        "maximiza", "maximizar", "maximize", "maximiza a janela",
+        "coloca em tela cheia", "tela cheia",
+    }):
+        nome = _extrair_nome_app(t, ["maximiza", "maximizar", "maximize"])
         return control.maximizar_janela(nome or "")
 
-    if any(p in t for p in ["mover janela", "move janela"]):
-        direcao = "esquerda" if "esquerda" in t else "direita"
+    if any(p in t for p in {
+        "mover janela", "move janela", "mova janela",
+        "mover para outro monitor", "move para outro monitor",
+        "manda pra outro monitor", "jogar no outro monitor",
+    }):
+        direcao = "esquerda" if any(p in t for p in {"esquerda", "left"}) else "direita"
         return control.mover_janela(_extrair_entre_aspas(t) or "", direcao)
 
-    if any(p in t for p in ["lista janelas", "janelas abertas", "o que esta aberto"]):
+    if any(p in t for p in {
+        "lista janelas", "listar janelas", "janelas abertas",
+        "o que esta aberto", "o que ta aberto", "quais janelas",
+        "mostra janelas", "ver janelas abertas", "quais programas abertos",
+    }):
         return control.listar_janelas()
 
-    if any(p in t for p in ["alterna janela", "alt tab"]):
+    if any(p in t for p in {
+        "alterna janela", "alternar janela", "alt tab",
+        "proxima janela", "trocar janela", "muda de janela",
+    }):
         return control.alternar_janela()
 
     # -----------------------------------------------------------------------
     # 9. CLIPBOARD
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["copia ", "copiar "]):
+    if any(p in t for p in {
+        "copia ", "copiar ", "copie ", "copia isso", "copia o texto",
+        "copiar texto", "copiar isso",
+    }):
         trecho = _extrair_entre_aspas(t)
         if trecho:
             return control.copiar_texto(trecho)
-    if any(p in t for p in ["cola ", "colar "]):
+
+    if any(p in t for p in {
+        "cola ", "colar ", "cole ", "colar texto", "cola o texto",
+        "cola aqui", "colar aqui",
+    }):
         return control.colar_texto()
-    if "clipboard" in t:
+
+    if any(p in t for p in {
+        "clipboard", "area de transferencia", "o que tem no clipboard",
+        "ver clipboard", "ler clipboard", "conteudo clipboard",
+    }):
         return control.obter_clipboard()
 
     # -----------------------------------------------------------------------
-    # 10. PESQUISA
+    # 10. PESQUISA NA WEB
     # -----------------------------------------------------------------------
-    for gatilho in ["pesquisa ", "pesquisar ", "busca ", "buscar ", "googla "]:
+    for gatilho in {
+        "pesquisa ", "pesquisar ", "pesquise ", "busca ", "buscar ", "busque ",
+        "googla ", "google ", "procura ", "procurar ", "procure ",
+        "pesquisa na web ", "busca na internet ", "pesquisa no google ",
+        "me mostra ", "mostra ", "pesquisa pra mim ",
+    }:
         if gatilho in t:
             query = t.split(gatilho, 1)[1].strip()
             if query:
@@ -556,54 +690,75 @@ def _parsear_controle_pc(texto, control):
     # -----------------------------------------------------------------------
     # 11. DIGITAR / TECLA
     # -----------------------------------------------------------------------
-    for gatilho in ["digita ", "digitar ", "digite ", "escreve ", "escreva "]:
+    for gatilho in {
+        "digita ", "digitar ", "digite ", "escreve ", "escreva ",
+        "escrever ", "digita ai ", "digita isso ", "escreve ai ",
+        "cola ai ", "digita pra mim ",
+    }:
         if gatilho in t:
             trecho = _extrair_entre_aspas(t) or t.split(gatilho, 1)[1].strip()
             if trecho:
                 return control.digitar_texto(trecho)
 
-    for gatilho in ["pressiona ", "pressione ", "aperta ", "aperte ", "tecla "]:
+    for gatilho in {
+        "pressiona ", "pressionar ", "pressione ",
+        "aperta ", "apertar ", "aperte ",
+        "tecla ", "aperta a tecla ", "pressiona a tecla ",
+    }:
         if gatilho in t:
             tecla = t.split(gatilho, 1)[1].strip().split()[0]
             if tecla:
                 return control.pressionar_tecla(tecla)
 
     # -----------------------------------------------------------------------
-    # 12. SISTEMA — status de CPU, RAM, disco e processos
-    # Cobre todas as formas naturais de perguntar sobre o sistema
+    # 12. SISTEMA — status de CPU, RAM, disco, bateria
     # -----------------------------------------------------------------------
     _TRIGGERS_STATUS_SISTEMA = {
-        # CPU/RAM direto
-        "cpu", "ram", "memoria ram",
-        # Frases naturais de status
-        "uso do sistema", "recursos do pc", "como ta o sistema",
-        "como esta o sistema", "como anda o sistema", "status do sistema",
+        # Direto
+        "cpu", "ram", "memoria ram", "bateria", "memoria livre", "espaco livre",
+        # Status geral — todas as variantes de fala
+        "uso do sistema", "recursos do pc", "recursos do computador",
+        "como ta o sistema", "como esta o sistema", "como anda o sistema",
         "como ta o pc", "como esta o pc", "como anda o pc",
         "como ta o computador", "como esta o computador",
-        "ta pesado", "esta pesado", "ta lento", "esta lento",
-        "quanto ta usando", "quanto esta usando",
-        "ta travando", "esta travando", "travando muito",
-        "bateria", "memoria livre", "espaco livre",
+        "ta pesado", "esta pesado", "to pesado",
+        "ta lento", "esta lento", "to lento",
+        "quanto ta usando", "quanto esta usando", "quanto to usando",
+        "ta travando", "esta travando", "travando muito", "to travando",
+        "status do sistema", "status do pc", "status do computador",
         "consumo de cpu", "consumo de ram", "consumo de memoria",
-        "desempenho do pc", "performance do pc",
+        "desempenho do pc", "desempenho do computador", "performance do pc",
+        "como esta a memoria", "como ta a memoria",
+        "quanto tem de ram", "quanto tem de cpu",
+        "verificar sistema", "checar sistema", "checa o sistema",
+        "ver uso de memoria", "ver uso de cpu",
+        "ta ruim o pc", "ta bom o pc",
     }
     if any(p in t for p in _TRIGGERS_STATUS_SISTEMA):
         return control.uso_cpu_ram()
 
-    if any(p in t for p in ["processos ativos", "o que esta rodando",
-                              "quais processos", "top processos"]):
+    if any(p in t for p in {
+        "processos ativos", "o que esta rodando", "o que ta rodando",
+        "quais processos", "top processos", "listar processos",
+        "ver processos", "processos em execucao", "programas rodando",
+    }):
         return control.processos_ativos()
 
-    if any(p in t for p in ["info do sistema", "sistema operacional",
-                              "qual windows", "versao do windows",
-                              "informacoes do sistema"]):
+    if any(p in t for p in {
+        "info do sistema", "informacoes do sistema", "informacao do sistema",
+        "sistema operacional", "qual windows", "qual o sistema",
+        "versao do windows", "que windows e esse", "que sistema e esse",
+    }):
         return control.info_sistema()
 
     # -----------------------------------------------------------------------
     # 13. SCROLL
     # -----------------------------------------------------------------------
-    if any(p in t for p in ["rola", "rolar", "scroll"]):
-        direcao = "cima" if any(p in t for p in ["cima", "up"]) else "baixo"
+    if any(p in t for p in {
+        "rola", "rolar", "scroll", "rola a pagina", "rolar a pagina",
+        "desce a pagina", "sobe a pagina", "rola pra baixo", "rola pra cima",
+    }):
+        direcao = "cima" if any(p in t for p in {"cima", "up", "subir", "pra cima"}) else "baixo"
         return control.rolar_pagina(direcao, _extrair_numero(t, 3))
 
     return None
@@ -633,37 +788,71 @@ def _extrair_nome_app(texto, gatilhos):
 # Classificador de intencao
 # ---------------------------------------------------------------------------
 
+# Palavras INDIVIDUAIS que classificam como acao — verificadas por palavra inteira
 _TRIGGERS_CONTROLE = {
+    # Abrir/fechar
     "abre", "abrir", "abra", "fecha", "fechar", "feche",
-    "encerra", "encerrar", "desliga", "desligar", "reinicia", "reiniciar",
+    "encerra", "encerrar", "mata", "matar", "lanca", "lancar",
+    "executa", "executar", "inicia", "iniciar", "roda", "rodar",
+    # Energia
+    "desliga", "desligar", "reinicia", "reiniciar", "reinicie",
     "suspende", "suspender", "hiberna", "hibernar", "bloqueia", "bloquear",
+    # Janelas
     "minimiza", "minimizar", "maximiza", "maximizar",
-    "copia", "copiar", "cola", "colar", "digita", "digitar",
-    "pressiona", "pressionar", "aperta", "apertar",
-    "pesquisa", "pesquisar", "busca", "buscar", "googla",
-    "screenshot", "printscreen",
-    "rola", "rolar", "scroll",
+    # Clipboard
+    "copia", "copiar", "cola", "colar",
+    # Teclado
+    "digita", "digitar", "pressiona", "pressionar", "aperta", "apertar",
+    # Web
+    "pesquisa", "pesquisar", "busca", "buscar", "googla", "procura", "procurar",
+    # Midia
+    "screenshot", "printscreen", "print",
+    "rola", "rolar", "scroll", "pausa", "pausar",
+    # Mensagem
     "manda", "mande", "envia", "envie",
-    "volume", "audio", "som", "musica", "faixa",
-    "cpu", "ram", "processos",
+    # Audio
+    "volume", "audio", "som", "musica", "midia",
+    # Sistema
+    "cpu", "ram", "processos", "bateria", "memoria",
+    # Arquivo
     "cria", "crie", "criar", "gera", "gere", "gerar",
-    # Status do sistema — precisam ser acao, nao conversa
-    "bateria", "memoria",
 }
 
-# Frases compostas de status do sistema (verificadas separadamente no classificador)
+# FRASES COMPOSTAS que classificam como acao — verificadas como substring
+# Sem estas, "como ta o sistema" nao teria nenhuma palavra individual no set acima
 _TRIGGERS_SISTEMA_FRASES = {
-    "uso do sistema", "recursos do pc",
+    # Status do sistema — com e sem acento (texto ja eh normalizado quando chega aqui)
+    "uso do sistema", "recursos do pc", "recursos do computador",
     "como ta o sistema", "como esta o sistema", "como anda o sistema",
-    "status do sistema", "como ta o pc", "como esta o pc",
-    "como ta o computador", "ta pesado", "esta pesado",
-    "ta lento", "esta lento", "quanto ta usando",
-    "ta travando", "esta travando", "consumo de cpu", "consumo de ram",
+    "como ta o pc", "como esta o pc", "como anda o pc",
+    "como ta o computador", "como esta o computador",
+    "ta pesado", "esta pesado", "ta lento", "esta lento",
+    "to pesado", "to lento", "to travando",
+    "quanto ta usando", "quanto esta usando",
+    "ta travando", "esta travando", "travando muito",
+    "status do sistema", "status do pc",
+    "consumo de cpu", "consumo de ram", "consumo de memoria",
     "desempenho do pc", "performance do pc", "espaco livre",
+    "checar sistema", "checa o sistema", "verificar sistema",
+    "como esta a memoria", "como ta a memoria",
+    "ta ruim o pc", "ta bom o pc",
+    # Controle de volume em frases compostas
+    "volume mais", "volume menos", "mais volume", "menos volume",
+    "aumentar volume", "diminuir volume", "volume alto", "volume baixo",
+    # Energia em frases compostas
+    "desligar o pc", "reiniciar o pc", "reiniciar o computador",
+    "desligar o computador", "apagar o pc",
+    # Screenshot em frases
+    "tira print", "tirar print", "captura de tela",
+    # Midia em frases
+    "proxima musica", "proxima faixa", "pula musica",
+    "musica anterior", "faixa anterior",
 }
 
 def _classificar_intencao(texto, neuronio):
-    t = texto.lower()
+    # Normaliza sem acentos para que os triggers funcionem igualmente
+    # com "música", "musica", "musíca" etc.
+    t = _normalizar(texto)
 
     if any(p in t for p in ["treina", "aprende", "evolui"]):
         return "treinar"
@@ -817,6 +1006,15 @@ class SiriusCerebro:
         self.filtro   = SiriusFiltro()
         self.neuronio = SiriusNeuronio()
         self.control  = SiriusControl()
+
+        # Visao computacional — carrega lazy
+        self._visao = None
+        try:
+            from sirius_visao import get_visao
+            self._visao = get_visao()
+            print("\033[92m[CEREBRO]: Visao computacional ativa.\033[0m")
+        except Exception as e:
+            print(f"\033[33m[CEREBRO]: Visao indisponivel: {e}\033[0m")
 
         # --- Módulos opcionais (carregados lazy) ---
         self._agentes    = None
@@ -1069,6 +1267,31 @@ class SiriusCerebro:
                 self._adicionar_contexto("assistant", resp_proativo)
                 self.memoria.salvar_historico(comando, resp_proativo)
                 return resp_proativo
+
+        # --- VISÃO — antes do classificador para não cair em "conversa" ---
+        _TRIGGERS_VISAO_RAPIDA = {
+            "o que tem na tela", "o que esta na tela", "o que ta na tela",
+            "leia a tela", "le a tela", "ler a tela", "leia o que esta",
+            "analisa a tela", "analise a tela", "descreve a tela",
+            "o que diz na tela", "o que esta escrito na tela",
+            "o que voce ve", "ve a tela", "olha a tela",
+            "qual e o erro na tela", "qual erro aparece",
+            "o que tem aberto", "o que aparece na tela",
+            "o que esta escrito", "leia o que ta escrito",
+            "resume o que esta aberto", "o que esta na minha tela",
+        }
+        cmd_norm = _normalizar(comando)
+        if any(p in cmd_norm for p in _TRIGGERS_VISAO_RAPIDA):
+            try:
+                from sirius_visao import get_visao
+                resp_visao = get_visao().analisar_tela(comando)
+                if resp_visao:
+                    self._adicionar_contexto("assistant", resp_visao)
+                    self.memoria.salvar_historico(comando, resp_visao)
+                    return resp_visao
+            except Exception as e:
+                print(f"[CEREBRO]: Visão falhou: {e}")
+                return "Não consegui analisar a tela. Instale: pip install pyautogui Pillow pytesseract"
 
         print("[CEREBRO]: Classificando: '{}'".format(comando))
         intencao = _classificar_intencao(comando, self.neuronio)
