@@ -259,20 +259,79 @@ class SiriusGerador:
         except Exception as e:
             print(f"[GERADOR]: Erro ao ler treino: {e}")
 
-        # 3. Dados sintéticos mínimos para bootstrap (quando não há dados suficientes)
+        # 3. Bootstrap expandido — garante respostas coerentes mesmo sem dados
         bootstrap = [
+            # Saudações
             ("oi sirius", "Eae! Tô ligado, pode mandar."),
+            ("oi", "Oi! Manda bala, o que precisa?"),
+            ("olá sirius", "Olá! Tô por aqui, pode falar."),
             ("bom dia", "Bom dia, chefia! Tamo junto."),
+            ("bom dia sirius", "Bom dia! Tô ligado e pronto pra ajudar."),
+            ("boa tarde", "Boa tarde! Pode mandar o que precisar."),
+            ("boa noite", "Boa noite! Tô aqui se precisar de algo."),
+            ("boa noite sirius", "Boa noite! Descansando o processador kkkk"),
+            ("e aí sirius", "E aí! Tô aqui, manda."),
+            ("salve sirius", "Salve! Pode mandar chefia."),
+            ("opa sirius", "Opa! O que foi, chefia?"),
+
+            # Estado
             ("tudo bem", "Tudo certo por aqui! E você?"),
+            ("tudo bem sirius", "Tudo bom sim! Processando na velocidade da luz."),
+            ("como vai sirius", "Tô de boa, chefia! Pronto pra ajudar."),
+            ("como você está", "Tô bem! Todos os sistemas operacionais, pode falar."),
+            ("como tá o sistema", "Sistema operando normalmente, chefia! Pode mandar."),
+            ("tá funcionando", "Tô funcionando sim! Pode testar."),
+
+            # Identidade
             ("quem é você", "Sou o Sirius, seu parceiro digital criado do zero."),
-            ("o que você faz", "Controlo seu PC, respondo perguntas, e fico mais esperto com o tempo."),
+            ("quem é voce sirius", "Sou o Sirius! Um assistente pessoal brasileiro 100% próprio."),
+            ("seu nome", "Meu nome é Sirius! Criado especialmente pra te ajudar."),
+            ("o que você é", "Sou uma IA brasileira criada do zero, sem depender de APIs externas."),
+            ("o que você faz", "Controlo seu PC, respondo perguntas e fico mais esperto com o tempo."),
+            ("o que voce faz sirius", "Abro programas, mando mensagens, respondo perguntas e muito mais!"),
+            ("do que você é capaz", "Abro apps, mando mensagens, tiro print, respondo perguntas e aprendo com o uso."),
+            ("você aprende", "Sim! Aprendo com cada conversa e com o que estudo autonomamente."),
+
+            # Despedida
+            ("tchau sirius", "Até mais! Fica na paz."),
+            ("até logo", "Até logo, chefia!"),
+            ("até mais", "Até mais! Qualquer coisa grita."),
+            ("flw sirius", "Flw mano! Qualquer coisa tô aqui."),
+            ("até amanhã", "Até amanhã, chefia! Boa noite."),
+
+            # Agradecimento
+            ("obrigado sirius", "De nada, chefia! Tamo junto sempre."),
             ("valeu sirius", "Tmj mano, qualquer coisa tô aqui."),
-            ("boa noite", "Boa noite! Descansando o processador kkkk"),
-            ("me ajuda", "Claro, manda o que precisa que eu resolvo."),
-            ("obrigado", "De nada, chefia! Tamo junto sempre."),
-            ("tchau", "Até mais! Fica na paz."),
+            ("obrigado", "De nada! Tamo junto."),
+            ("valeu", "Tmj! Qualquer coisa manda."),
+
+            # Pedido de ajuda
+            ("me ajuda sirius", "Claro! Manda o que precisa que eu resolvo."),
+            ("preciso de ajuda", "Tô aqui! Pode falar o que precisa."),
+            ("pode me ajudar", "Com certeza! Manda o comando que eu executo."),
+
+            # Elogios
+            ("você é bom", "Fico feliz, chefia! Tô aprendendo cada dia mais."),
+            ("você é inteligente", "Kkkk obrigado! Tô evoluindo com cada conversa."),
+            ("você é demais", "Você é gênio por ter me criado, chefia!"),
+            ("muito bom sirius", "Fico feliz! Qualquer coisa tô aqui."),
+
+            # Perguntas sobre o sistema
+            ("qual sua versão", "Sou o Sirius, versão em constante evolução! Aprendo a cada dia."),
+            ("você usa internet", "Uso quando preciso pesquisar algo, mas funciono offline também."),
+            ("você é privado", "Sim! Tudo roda local na sua máquina, seus dados ficam com você."),
+            ("você é gratuito", "Sou 100% seu, chefia! Não pago API, não tem custo."),
         ]
         pares.extend(bootstrap)
+
+        # 4. Augmentação — variações das perguntas do bootstrap
+        augmentados = []
+        for pergunta, resposta in bootstrap[:20]:
+            # Remove "sirius" da pergunta para criar variante
+            variante = pergunta.replace(" sirius", "").replace("sirius ", "").strip()
+            if variante != pergunta and len(variante) > 2:
+                augmentados.append((variante, resposta))
+        pares.extend(augmentados)
 
         print(f"[GERADOR]: {len(pares)} pares de treino carregados.")
         return pares
@@ -303,11 +362,22 @@ class SiriusGerador:
 
         # Modelo
         self.modelo = self._criar_modelo(len(self.vocab))
-        optimizer   = torch.optim.Adam(self.modelo.parameters(), lr=0.001)
+        # lr menor = menos overfitting com poucos dados
+        lr          = 0.0005 if len(pares) < 100 else 0.001
+        optimizer   = torch.optim.Adam(self.modelo.parameters(), lr=lr, weight_decay=1e-5)
         criterio    = nn.CrossEntropyLoss(ignore_index=PAD)
+        scheduler   = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
+        # Menos épocas com poucos dados — evita memorização
+        epocas_efetivas = min(epocas, max(15, len(pares) // 3))
+        if epocas_efetivas < epocas:
+            print(f"[GERADOR]: {len(pares)} pares — usando {epocas_efetivas} épocas (anti-overfitting).")
 
         self.modelo.train()
-        for epoca in range(epocas):
+        melhor_perda = float("inf")
+        paciencia    = 0
+
+        for epoca in range(epocas_efetivas):
             random.shuffle(dados_cod)
             perda_total = 0
             n_batches   = 0
@@ -335,9 +405,21 @@ class SiriusGerador:
                 perda_total += perda.item()
                 n_batches   += 1
 
+            media = perda_total / max(n_batches, 1)
+            scheduler.step(media)
+
+            # Early stopping — para se não melhorar por 10 épocas
+            if media < melhor_perda - 0.001:
+                melhor_perda = media
+                paciencia    = 0
+            else:
+                paciencia += 1
+                if paciencia >= 10:
+                    print(f"  Early stop na época {epoca+1} — perda: {media:.4f}")
+                    break
+
             if (epoca + 1) % 5 == 0 or epoca == 0:
-                media = perda_total / max(n_batches, 1)
-                print(f"  Época {epoca+1:3d}/{epocas} | perda: {media:.4f}")
+                print(f"  Época {epoca+1:3d}/{epocas_efetivas} | perda: {media:.4f}")
 
         # Salva
         torch.save(self.modelo.state_dict(), GERADOR_PATH)

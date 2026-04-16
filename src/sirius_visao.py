@@ -277,6 +277,15 @@ class AnalisadorTela:
                 "Pode ser que o conteúdo seja uma imagem ou esteja em baixa resolução."
             )
 
+        # ── Detecta se o OCR produziu lixo ────────────────────────────────
+        if self._ocr_e_lixo(texto):
+            return (
+                "Capturei a tela mas o conteúdo é visual ou tem texto estilizado "
+                "que o OCR não consegue ler bem. "
+                "Se quiser que eu leia um texto específico, "
+                "tenta deixar só a janela com o texto em foco."
+            )
+
         tipo = self._detectar_tipo(texto)
         linhas = [l.strip() for l in texto.split("\n") if len(l.strip()) > 2]
         n_palavras = len(texto.split())
@@ -284,43 +293,81 @@ class AnalisadorTela:
         # Modo leitura — retorna o texto completo
         if modo == "ler":
             if len(texto) > 800:
-                return f"O texto na tela é longo ({n_palavras} palavras). Aqui estão as primeiras linhas:\n{chr(10).join(linhas[:10])}"
-            return f"O que está escrito na tela:\n{texto[:600]}"
-
-        # Modo erro — analisa mensagem de erro
-        if modo == "erro" or tipo == "erro":
-            erros = []
-            for linha in linhas:
-                if any(re.search(p, linha.lower()) for p in self._PADROES["erro"]):
-                    erros.append(linha)
-            if erros:
-                msg_erro = erros[0][:200]
                 return (
-                    f"Detectei um erro na tela: '{msg_erro}'. "
-                    f"Total de {len(erros)} linha(s) com erro. "
-                    f"Quer que eu pesquise sobre esse erro?"
+                    f"O texto na tela é longo, uns {n_palavras} palavras. "
+                    f"Aqui as primeiras linhas:\n{chr(10).join(linhas[:10])}"
+                )
+            return f"O que está escrito:\n{texto[:600]}"
+
+        # Modo erro
+        if modo == "erro" or tipo == "erro":
+            erros = [l for l in linhas
+                     if any(re.search(p, l.lower()) for p in self._PADROES["erro"])]
+            if erros:
+                return (
+                    f"Detectei um erro: '{erros[0][:200]}'. "
+                    f"Total de {len(erros)} linha(s) com problema. "
+                    "Quer que eu pesquise sobre esse erro?"
                 )
             return f"Não identifiquei erros claros. O que vi: {self._resumir(texto)}"
 
         # Modo código
         if tipo == "codigo" or modo == "codigo":
-            linguagem = "Python" if "def " in texto or "import " in texto else \
-                        "JavaScript" if "function " in texto or "const " in texto else \
-                        "código"
+            linguagem = (
+                "Python"     if any(k in texto for k in ["def ", "import ", "elif "]) else
+                "JavaScript" if any(k in texto for k in ["function ", "const ", "let "]) else
+                "código"
+            )
             return (
                 f"Tem {linguagem} na tela com {n_palavras} palavras. "
-                f"Primeiras linhas: {chr(10).join(linhas[:5])}"
+                f"Primeiras linhas:\n{chr(10).join(linhas[:5])}"
             )
 
         # Modo resumo / geral
         resumo = self._resumir(texto)
         if tipo == "documento":
-            return f"Tem um documento na tela com ~{n_palavras} palavras. Resumo: {resumo}"
+            return f"Tem um documento com ~{n_palavras} palavras. Resumo: {resumo}"
         if tipo == "url":
             urls = re.findall(r"https?://\S+", texto)
-            return f"Vejo URLs na tela: {', '.join(urls[:3])}. Contexto: {resumo}"
+            return f"Vejo URLs: {', '.join(urls[:3])}. Contexto: {resumo}"
 
         return f"Na tela: {resumo}"
+
+    def _ocr_e_lixo(self, texto: str) -> bool:
+        """
+        Detecta se o resultado do OCR é inútil.
+        Critérios:
+        - Mais de 40% de caracteres especiais/lixo
+        - Palavras médias muito curtas (menos de 2 chars)
+        - Poucas palavras reais reconhecíveis
+        """
+        if not texto:
+            return True
+
+        import re as _re
+
+        # Remove espaços e newlines para análise
+        chars_validos = _re.sub(r"[a-záéíóúàãõêôç\w\s]", "", texto.lower())
+        pct_lixo = len(chars_validos) / max(len(texto), 1)
+        if pct_lixo > 0.35:
+            return True
+
+        # Analisa palavras
+        palavras = [p for p in texto.split() if len(p) > 1]
+        if not palavras:
+            return True
+
+        # Se a maioria das "palavras" são sequências sem vogal = lixo
+        sem_vogal = [p for p in palavras if not _re.search(r"[aeiouáéíóú]", p.lower())]
+        if len(sem_vogal) / len(palavras) > 0.6:
+            return True
+
+        # Comprimento médio de palavras muito baixo = lixo
+        media_len = sum(len(p) for p in palavras) / len(palavras)
+        if media_len < 2.5:
+            return True
+
+        return False
 
 
 # ---------------------------------------------------------------------------

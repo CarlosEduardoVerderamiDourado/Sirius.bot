@@ -183,14 +183,26 @@ class SiriusAudio:
 
         print(f"\033[92m[SIRIUS]:\033[0m {texto_limpo}")
 
-        # ✅ Ativa mute do microfone antes de falar
+        # Cascata: ElevenLabs → Kokoro → pyttsx3
         self._falando = True
         try:
             if not self._falar_elevenlabs(texto_limpo):
-                self._falar_windows(texto_limpo)
+                if not self._falar_kokoro(texto_limpo):
+                    self._falar_windows(texto_limpo)
         finally:
-            # ✅ Sempre desativa mute ao terminar, mesmo se der erro
             self._falando = False
+
+
+    def _falar_kokoro(self, texto: str) -> bool:
+        """Voz neural local Kokoro — gratuita, alta qualidade, sem internet."""
+        try:
+            from sirius_tts import get_tts
+            tts = get_tts()
+            if tts.kokoro_disponivel:
+                return tts.falar(texto)
+            return False
+        except Exception:
+            return False
 
     def _falar_elevenlabs(self, texto: str) -> bool:
         if not self.api_key or len(self.api_key) <= 5:
