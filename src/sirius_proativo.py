@@ -284,6 +284,153 @@ class MonitorHora:
 
 
 # ---------------------------------------------------------------------------
+# Briefing Matinal — fala sem ser perguntado todo dia de manhã
+# ---------------------------------------------------------------------------
+
+class BriefingMatinal:
+    """
+    Gera e fala um briefing completo todo dia, automaticamente.
+
+    Conteúdo (na ordem):
+      1. Saudação + data/dia da semana
+      2. Clima do dia (temperatura, chuva)
+      3. Lembretes do dia (se tiver)
+      4. Status do sistema (bateria, se notebook)
+      5. Frase motivacional aleatória
+
+    Horário padrão: entre 7h e 9h, 1x por dia.
+    Configurável via: briefing.configurar(hora_inicio=7, hora_fim=9)
+
+    Também pode ser acionado sob demanda:
+      "sirius, briefing"
+      "sirius, me dá o resumo do dia"
+      "sirius, o que tem pra hoje"
+    """
+
+    _FRASES_MOTIVACIONAIS = [
+        "Hoje é mais um dia pra mandar bem, chefia.",
+        "Foco total. Vamos que vamos.",
+        "Tô aqui do seu lado. Pode mandar.",
+        "Missão do dia: arrasar. Pode deixar que eu cuido do resto.",
+        "Mais um dia, mais uma chance de evoluir.",
+        "Sistemas operacionais. Pronto pra missão.",
+        "Hoje vai ser bom. Eu sinto nos meus circuitos.",
+        "Carpe diem, chefia. Bora fazer acontecer.",
+    ]
+
+    def __init__(self, lembretes_ref: list):
+        """
+        lembretes_ref: referência à lista de lembretes do SiriusProativo
+        """
+        self._lembretes   = lembretes_ref
+        self._ultimo_dia  = ""          # controla 1x por dia
+        self._hora_inicio = 7
+        self._hora_fim    = 9
+
+    def configurar(self, hora_inicio: int = 7, hora_fim: int = 9):
+        """Muda a janela horária do briefing."""
+        self._hora_inicio = hora_inicio
+        self._hora_fim    = hora_fim
+
+    def deve_disparar(self) -> bool:
+        """Retorna True se está na janela horária e ainda não disparou hoje."""
+        agora = datetime.now()
+        hoje  = agora.date().isoformat()
+        hora  = agora.hour
+        return (
+            hoje != self._ultimo_dia and
+            self._hora_inicio <= hora <= self._hora_fim
+        )
+
+    def marcar_disparado(self):
+        self._ultimo_dia = datetime.now().date().isoformat()
+
+    def gerar(self) -> list[str]:
+        """
+        Gera o briefing como lista de partes para falar em sequência.
+        Cada parte é uma frase curta — permite pausas naturais entre elas.
+        """
+        partes = []
+        agora  = datetime.now()
+
+        # ── 1. Saudação + data ────────────────────────────────────────────
+        dia_sem = DIAS_SEMANA[agora.weekday()]
+        dia_num = agora.day
+        mes     = MESES[agora.month]
+        hora    = agora.strftime("%H:%M")
+        partes.append(
+            f"Bom dia, chefia! São {hora} de {dia_sem}, "
+            f"{dia_num} de {mes}."
+        )
+
+        # ── 2. Clima ──────────────────────────────────────────────────────
+        try:
+            from sirius_tempo_real import obter_clima_atual, _detectar_cidade_por_ip
+            cidade = _detectar_cidade_por_ip()
+            clima  = obter_clima_atual(cidade)
+            # Encurta se muito longo
+            if len(clima) > 150:
+                clima = clima[:150].rsplit(".", 1)[0] + "."
+            partes.append(f"Clima de hoje: {clima}")
+        except Exception:
+            pass
+
+        # ── 3. Chuva ──────────────────────────────────────────────────────
+        try:
+            from sirius_tempo_real import vai_chover, _detectar_cidade_por_ip
+            chuva = vai_chover(_detectar_cidade_por_ip())
+            if chuva and any(p in chuva.lower() for p in
+                             ["boa chance", "pode chover", "chuva forte", "sim"]):
+                partes.append(chuva)
+        except Exception:
+            pass
+
+        # ── 4. Lembretes do dia ───────────────────────────────────────────
+        lembretes_hoje = [
+            l for l in self._lembretes
+            if not (l.disparado and not l.repetir)
+        ]
+        if lembretes_hoje:
+            if len(lembretes_hoje) == 1:
+                l = lembretes_hoje[0]
+                partes.append(
+                    f"Você tem um lembrete hoje: {l.hora:02d}:{l.minuto:02d}, {l.descricao}."
+                )
+            else:
+                lista = ", ".join(
+                    f"{l.hora:02d}:{l.minuto:02d} {l.descricao}"
+                    for l in lembretes_hoje[:4]
+                )
+                partes.append(
+                    f"Você tem {len(lembretes_hoje)} lembretes hoje: {lista}."
+                )
+        else:
+            partes.append("Sem lembretes agendados pra hoje.")
+
+        # ── 5. Status da bateria (só se notebook e não carregando) ────────
+        try:
+            import psutil
+            bat = psutil.sensors_battery()
+            if bat and not bat.power_plugged and bat.percent < 80:
+                partes.append(
+                    f"Bateria em {bat.percent:.0f}%. "
+                    "Lembra de carregar antes de sair."
+                )
+        except Exception:
+            pass
+
+        # ── 6. Frase do dia ───────────────────────────────────────────────
+        import random
+        partes.append(random.choice(self._FRASES_MOTIVACIONAIS))
+
+        return partes
+
+    def gerar_texto_completo(self) -> str:
+        """Versão em texto único — para exibir no chat."""
+        return " ".join(self.gerar())
+
+
+# ---------------------------------------------------------------------------
 # Motor principal
 # ---------------------------------------------------------------------------
 
@@ -304,6 +451,7 @@ class SiriusProativo:
         self._monitor_sistema = MonitorSistema()
         self._monitor_clima   = MonitorClima()
         self._monitor_hora    = MonitorHora()
+        self._briefing        = BriefingMatinal(self._lembretes)
 
         self._carregar()
 
@@ -358,9 +506,46 @@ class SiriusProativo:
             if _ciclo % 10 == 0:   # clima a cada ~5min
                 alertas += self._monitor_clima.verificar()
 
+            # Briefing matinal — verifica a cada ciclo, dispara 1x por dia
+            if self._briefing.deve_disparar():
+                self._briefing.marcar_disparado()
+                threading.Thread(
+                    target=self._disparar_briefing,
+                    daemon=True
+                ).start()
+                continue  # pula outros alertas — briefing já é completo
+
             for msg in alertas:
                 threading.Thread(target=self._disparar, args=(msg,), daemon=True).start()
                 time.sleep(2)
+
+    def _disparar_briefing(self):
+        """
+        Dispara o briefing matinal falando cada parte separadamente.
+        Pausa natural entre cada frase — não vira um monólogo.
+        """
+        print("\n\033[93m[PROATIVO]: Iniciando briefing matinal...\033[0m")
+        partes = self._briefing.gerar()
+
+        for i, parte in enumerate(partes):
+            print(f"\033[93m[BRIEFING {i+1}/{len(partes)}]: {parte}\033[0m")
+            try:
+                self._falar(parte)
+            except Exception as e:
+                print(f"[PROATIVO]: Erro ao falar parte do briefing: {e}")
+
+            if self._log:
+                try:
+                    prefixo = "🌅" if i == 0 else "📋" if i < len(partes)-1 else "⚡"
+                    self._log(f"{prefixo} {parte}")
+                except Exception:
+                    pass
+
+            # Pausa entre partes para não soar robotizado
+            if i < len(partes) - 1:
+                time.sleep(1.5)
+
+        print("\033[93m[PROATIVO]: Briefing matinal concluído.\033[0m")
 
     def _verificar_lembretes(self) -> list[str]:
         msgs = []
@@ -409,6 +594,13 @@ class SiriusProativo:
         "nivel da bateria", "nível da bateria",
         "quanto tem de bateria", "memoria disponivel",
     }
+    _TRIGGERS_BRIEFING = {
+        "briefing", "resumo do dia", "o que tem pra hoje",
+        "o que tem hoje", "me dá o briefing", "me da o briefing",
+        "resumo matinal", "relatorio do dia", "relatório do dia",
+        "me atualiza", "novidades do dia", "como ta o dia",
+        "o que acontece hoje", "agenda do dia",
+    }
 
     def e_comando_proativo(self, texto: str) -> bool:
         t = texto.lower()
@@ -416,12 +608,15 @@ class SiriusProativo:
             any(tr in t for tr in self._TRIGGERS_LEMBRETE) or
             any(tr in t for tr in self._TRIGGERS_LISTAR) or
             any(tr in t for tr in self._TRIGGERS_CANCELAR) or
-            any(tr in t for tr in self._TRIGGERS_STATUS)
+            any(tr in t for tr in self._TRIGGERS_STATUS) or
+            any(tr in t for tr in self._TRIGGERS_BRIEFING)
         )
 
     def processar_comando(self, texto: str) -> str:
         t = texto.lower().strip()
 
+        if any(tr in t for tr in self._TRIGGERS_BRIEFING):
+            return self._briefing_sob_demanda()
         if any(tr in t for tr in self._TRIGGERS_LISTAR):
             return self._listar_lembretes()
         if any(tr in t for tr in self._TRIGGERS_CANCELAR):
@@ -432,6 +627,19 @@ class SiriusProativo:
             return self._adicionar_lembrete(texto)
 
         return "Não entendi. Tente: 'me lembra às 15h de tomar remédio'."
+
+    def _briefing_sob_demanda(self) -> str:
+        """
+        Dispara o briefing imediatamente quando solicitado.
+        Fala em background e retorna confirmação.
+        """
+        threading.Thread(target=self._disparar_briefing, daemon=True).start()
+        return "Preparando seu briefing, chefia!"
+
+    def configurar_briefing(self, hora_inicio: int = 7, hora_fim: int = 9):
+        """Configura o horário do briefing matinal."""
+        self._briefing.configurar(hora_inicio, hora_fim)
+        return f"Briefing configurado para entre {hora_inicio:02d}h e {hora_fim:02d}h."
 
     def _adicionar_lembrete(self, texto: str) -> str:
         resultado = _extrair_horario(texto)
@@ -483,24 +691,38 @@ class SiriusProativo:
         return "Sem lembretes para cancelar."
 
     def _status_sistema(self) -> str:
-        partes = []
+        """Formato Jarvis: 'Online. CPU 12% | RAM 45%. Tudo nominal.'"""
         try:
             import psutil
-            bat = psutil.sensors_battery()
-            if bat:
-                status = "carregando" if bat.power_plugged else f"{bat.percent:.0f}%"
-                partes.append(f"Bateria {status}")
-            mem = psutil.virtual_memory()
-            partes.append(f"RAM {mem.percent:.0f}% usada")
-            cpu = psutil.cpu_percent(interval=0.5)
-            partes.append(f"CPU {cpu:.0f}%")
-            disco = psutil.disk_usage("/")
-            partes.append(f"Disco {disco.free/(1024**3):.1f} GB livres")
+            from filtro_zoeiro import SiriusFiltro
+
+            cpu       = psutil.cpu_percent(interval=0.5)
+            mem       = psutil.virtual_memory()
+            disco     = psutil.disk_usage("/")
+            bat       = psutil.sensors_battery()
+            bateria   = bat.percent if bat else None
+
+            msg = SiriusFiltro.formatar_status(
+                cpu          = cpu,
+                ram          = mem.percent,
+                ram_usada_mb = mem.used   // (1024 * 1024),
+                ram_total_mb = mem.total  // (1024 * 1024),
+                bateria      = bateria,
+                disco        = disco.percent,
+            )
+
+            # Adiciona info de bateria se estiver descarregando
+            if bat and not bat.power_plugged and bat.percent <= 30:
+                mins = int(bat.secsleft / 60) if bat.secsleft and bat.secsleft > 0 else 0
+                sufixo = f" ~{mins}min restantes." if mins > 0 else ""
+                msg += f"{sufixo} Conecta o carregador."
+
+            return msg
+
         except ImportError:
             return "Instala psutil: pip install psutil"
         except Exception as e:
             return f"Erro ao verificar sistema: {e}"
-        return " | ".join(partes) + "."
 
     # -----------------------------------------------------------------------
     # Controle

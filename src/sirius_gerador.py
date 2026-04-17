@@ -19,6 +19,7 @@ import re
 import random
 from collections import Counter
 
+
 # --- PATH ---
 diretorio_src  = os.path.dirname(os.path.abspath(__file__))
 diretorio_raiz = os.path.dirname(diretorio_src)

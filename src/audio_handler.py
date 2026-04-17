@@ -30,6 +30,35 @@ WAKE_WORD_VARIANTES = {
     "serios", "seídios", "sídios", "sirius"
 }
 
+# Caminho do som de ativação estilo Jarvis
+_CAMINHO_SOM_ATIVACAO = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "sirius_ativacao.wav"
+)
+
+
+def _tocar_som_ativacao():
+    """
+    Toca o som de ativação do Sirius.
+    Prioridade: sirius_ativacao.wav (estilo Jarvis) → winsound.Beep (fallback)
+    """
+    try:
+        if os.path.exists(_CAMINHO_SOM_ATIVACAO):
+            import pygame as _pg
+            if not _pg.mixer.get_init():
+                _pg.mixer.init()
+            _pg.mixer.Sound(_CAMINHO_SOM_ATIVACAO).play()
+            return
+    except Exception:
+        pass
+    # Fallback — beep duplo simples
+    try:
+        winsound.Beep(700,  80)
+        time.sleep(0.04)
+        winsound.Beep(1100, 130)
+    except Exception:
+        pass
+
 
 
 def _eh_transcricao_ruim(texto: str) -> bool:
@@ -316,7 +345,7 @@ class SiriusAudio:
             print(f"\033[90m[DEBUG AUDIO]: (pos wakeword) '{texto}'\033[0m")
             texto, tinha = self._normalizar_wake_word(texto)
             if tinha:
-                winsound.Beep(1000, 100)
+                _tocar_som_ativacao()
             if "sirius" not in texto:
                 texto = f"sirius {texto}"
             return texto
@@ -364,7 +393,7 @@ class SiriusAudio:
             print(f"\033[90m[DEBUG AUDIO]: '{texto}'\033[0m")
             texto, tinha = self._normalizar_wake_word(texto)
             if tinha:
-                winsound.Beep(1000, 150)
+                _tocar_som_ativacao()
             return texto
 
         except (OSError, AttributeError):

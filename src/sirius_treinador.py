@@ -9,6 +9,7 @@ import sys
 import time
 import threading
 import sqlite3
+from sirius_gerador import Vocabulario, SiriusGerador
 
 diretorio_src  = os.path.dirname(os.path.abspath(__file__))
 diretorio_raiz = os.path.dirname(diretorio_src)
