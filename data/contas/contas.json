@@ -1,0 +1,29 @@
+[
+  {
+    "id": "39d96289-227",
+    "nome": "Principal",
+    "pin_hash": "",
+    "criado_em": "2026-04-18T12:29:03.756810",
+    "ultima_sessao": "2026-04-18T12:29:03.759371",
+    "total_sessoes": 0,
+    "ativa": true
+  },
+  {
+    "id": "360e279e-f5f",
+    "nome": "Convidado",
+    "pin_hash": "",
+    "criado_em": "2026-04-18T12:29:03.760411",
+    "ultima_sessao": "",
+    "total_sessoes": 0,
+    "ativa": true
+  },
+  {
+    "id": "f65d8704-f8a",
+    "nome": "Carlos",
+    "pin_hash": "",
+    "criado_em": "2026-04-18T19:42:34.064230",
+    "ultima_sessao": "",
+    "total_sessoes": 0,
+    "ativa": true
+  }
+]

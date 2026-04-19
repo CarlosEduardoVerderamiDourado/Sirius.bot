@@ -4,33 +4,49 @@ import random
 import threading
 import os
 import time
-from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
-                                QLabel, QFrame, QLineEdit, QPushButton, QTextEdit)
+from datetime import datetime
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QWidget, QLabel, QFrame, QLineEdit, QPushButton,
+    QTextEdit, QSizePolicy,
+)
 from PySide6.QtCore import Qt, QSize, QTimer, QThread, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import *
 from OpenGL.GLU import *
 
-# --- PATH ---
 caminho_atual = os.path.dirname(os.path.abspath(__file__))
 if caminho_atual not in sys.path:
     sys.path.append(caminho_atual)
 
 from audio_handler import SiriusAudio
 
-# ---------------------------------------------------------------------------
-# Worker — gerencia voz e texto em thread separada
-# ---------------------------------------------------------------------------
+COR_FUNDO        = "#000000"
+COR_AZUL_NEON    = "#5DE2FF"
+COR_AZUL_ESCURO  = "#0a1a2a"
+COR_VERDE        = "#00FF88"
+COR_BRANCO       = "#FFFFFF"
+COR_AMARELO      = "#FFD700"
+COR_CINZA        = "#2a3a4a"
+COR_TEXTO_HORA   = "#4a7a9a"
+
+ESTADO_STANDBY     = "STANDBY"
+ESTADO_OUVINDO     = "OUVINDO"
+ESTADO_PROCESSANDO = "PROCESSANDO"
+ESTADO_FALANDO     = "FALANDO"
+
 
 class SiriusWorker(QThread):
     comando_detectado = Signal(str)
     resposta_pronta   = Signal(str)
-    status_fala       = Signal(bool)
+    estado_mudou      = Signal(str)
 
     def __init__(self, audio_sys, cerebro):
         super().__init__()
         self.audio          = audio_sys
-        self.cerebro        = cerebro          # ← recebe o cérebro já instanciado
+        self.cerebro        = cerebro
         self.comando_manual = None
         self.lock           = threading.Lock()
         self.rodando        = True
@@ -43,56 +59,48 @@ class SiriusWorker(QThread):
     def run(self):
         print("\033[94m[WORKER]: Núcleo de processamento ativo.\033[0m")
         while self.rodando:
-            try:
-                fala_usuario = None
+            fala_usuario = None
+            with self.lock:
+                if self.comando_manual:
+                    fala_usuario        = self.comando_manual
+                    self.comando_manual = None
 
-                # Prioridade 1: Texto manual
-                with self.lock:
-                    if self.comando_manual:
-                        fala_usuario        = self.comando_manual
-                        self.comando_manual = None
+            if not fala_usuario and self.modo_voz_ativo:
+                self.estado_mudou.emit(ESTADO_OUVINDO)
+                try:
+                    resultado_voz = self.audio.escutar_fluxo_continuo()
+                    if resultado_voz:
+                        fala_usuario = resultado_voz
+                    else:
+                        self.estado_mudou.emit(ESTADO_STANDBY)
+                except Exception as e:
+                    print(f"[ERRO ÁUDIO]: {e}")
+                    self.estado_mudou.emit(ESTADO_STANDBY)
+                    time.sleep(1)
+                    continue
 
-                # Prioridade 2: Voz
-                if not fala_usuario and self.modo_voz_ativo:
+            if fala_usuario:
+                comando_str = str(fala_usuario).strip()
+                if not comando_str:
+                    time.sleep(0.01)
+                    continue
+                self.estado_mudou.emit(ESTADO_PROCESSANDO)
+                self.comando_detectado.emit(comando_str)
+                tem_wake_word = "sirius" in comando_str.lower()
+                resposta = self.cerebro.processar(
+                    comando_str,
+                    forcar_processamento=not tem_wake_word
+                )
+                if resposta:
+                    self.resposta_pronta.emit(str(resposta))
+                    self.estado_mudou.emit(ESTADO_FALANDO)
                     try:
-                        resultado_voz = self.audio.escutar_fluxo_continuo()
-                        if resultado_voz:
-                            fala_usuario = resultado_voz
-                    except Exception as e:
-                        print(f"[ERRO ÁUDIO]: {e}")
-                        time.sleep(1)
-                        continue
-
-                if fala_usuario:
-                    comando_str = str(fala_usuario).strip()
-                    if not comando_str:
-                        time.sleep(0.01)
-                        continue
-
-                    self.comando_detectado.emit(comando_str)
-
-                    tem_wake_word = "sirius" in comando_str.lower()
-                    resposta = self.cerebro.processar(
-                        comando_str,
-                        forcar_processamento=not tem_wake_word
-                    )
-
-                    if resposta:
-                        self.resposta_pronta.emit(str(resposta))
-                        self.status_fala.emit(True)
-                        try:
-                            self.audio.falar(resposta)
-                        except Exception as e:
-                            print(f"[WORKER]: Erro ao falar: {e}")
-                        finally:
-                            self.status_fala.emit(False)
-
-                time.sleep(0.01)
-
-            except Exception as e:
-                # Captura qualquer exceção inesperada para não derrubar o worker
-                print(f"\033[31m[WORKER]: Erro inesperado (recuperando): {type(e).__name__}: {e}\033[0m")
-                time.sleep(1)  # pausa antes de tentar de novo
+                        self.audio.falar(resposta)
+                    finally:
+                        self.estado_mudou.emit(ESTADO_STANDBY)
+                else:
+                    self.estado_mudou.emit(ESTADO_STANDBY)
+            time.sleep(0.01)
 
     def parar(self):
         self.rodando = False
@@ -100,67 +108,85 @@ class SiriusWorker(QThread):
         self.wait()
 
 
-# ---------------------------------------------------------------------------
-# Visualização 3D
-# ---------------------------------------------------------------------------
-
 class SiriusNexus3DView(QOpenGLWidget):
+    _CORES = {
+        ESTADO_STANDBY:     (93/255, 226/255, 255/255),
+        ESTADO_OUVINDO:     (0/255,  255/255, 136/255),
+        ESTADO_PROCESSANDO: (255/255, 215/255, 0/255),
+        ESTADO_FALANDO:     (1.0,    1.0,     1.0),
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(QSize(600, 400))
-        self.rotation      = 0
-        self.pulse         = 0
-        self._esta_falando = False
-        self.COR_NEON_AZUL = (93/255, 226/255, 255/255)
-        self.COR_BRANCO    = (1.0, 1.0, 1.0)
+        self.setMinimumSize(QSize(580, 360))
+        self._estado   = ESTADO_STANDBY
+        self._cor      = self._CORES[ESTADO_STANDBY]
+        self._cor_alvo = self._cor
+        self.rotation  = 0.0
+        self.rotation2 = 0.0
+        self.pulse     = 0.0
 
         self.pontos_plexus = []
-        self.pontos_nucleo = []
-
-        for _ in range(1200):
+        for _ in range(900):
             phi      = random.uniform(0, 2 * math.pi)
             costheta = random.uniform(-1, 1)
             theta    = math.acos(costheta)
-            r        = 2.4
+            r        = 2.2
             x = r * math.sin(theta) * math.cos(phi)
             y = r * math.sin(theta) * math.sin(phi)
             z = r * math.cos(theta)
-            self.pontos_plexus.append({'pos': [x, y, z], 'orig': [x, y, z]})
+            self.pontos_plexus.append({"pos": [x,y,z], "orig": [x,y,z]})
 
-        for _ in range(500):
-            r_core   = random.uniform(0, 0.6)
-            phi      = random.uniform(0, 2 * math.pi)
-            costheta = random.uniform(-1, 1)
-            theta    = math.acos(costheta)
-            cx = r_core * math.sin(theta) * math.cos(phi)
-            cy = r_core * math.sin(theta) * math.sin(phi)
-            cz = r_core * math.cos(theta)
-            self.pontos_nucleo.append([cx, cy, cz])
+        self.pontos_nucleo = []
+        for _ in range(300):
+            r_c = random.uniform(0.0, 0.5)
+            phi = random.uniform(0, 2 * math.pi)
+            cos = random.uniform(-1, 1)
+            the = math.acos(cos)
+            self.pontos_nucleo.append([
+                r_c*math.sin(the)*math.cos(phi),
+                r_c*math.sin(the)*math.sin(phi),
+                r_c*math.cos(the),
+            ])
+
+        N = 120
+        self.anel1 = [(2.8*math.cos(2*math.pi*i/N), 2.8*math.sin(2*math.pi*i/N), 0.0) for i in range(N)]
+        self.anel2 = [(2.6*math.cos(2*math.pi*i/N), 0.0, 2.6*math.sin(2*math.pi*i/N)) for i in range(N)]
 
         self.timer = QTimer()
-        self.timer.timeout.connect(self.update_animation)
-        self.timer.start(16)  # ~60fps
+        self.timer.timeout.connect(self._animar)
+        self.timer.start(16)
+
+    def set_estado(self, estado: str):
+        self._estado   = estado
+        self._cor_alvo = self._CORES.get(estado, self._CORES[ESTADO_STANDBY])
 
     @property
-    def esta_falando(self): return self._esta_falando
+    def esta_falando(self):
+        return self._estado == ESTADO_FALANDO
 
     @esta_falando.setter
-    def esta_falando(self, valor):
-        self._esta_falando = valor
-        self.update()
+    def esta_falando(self, v):
+        self.set_estado(ESTADO_FALANDO if v else ESTADO_STANDBY)
 
-    def update_animation(self):
-        vel_rotacao = 1.2 if self._esta_falando else 0.4
-        self.rotation += vel_rotacao
-        self.pulse    += 0.08
-        amplitude      = 0.15 if self._esta_falando else 0.03
-        factor         = 1.0 + math.sin(self.pulse) * amplitude
+    def _animar(self):
+        self._cor = (
+            self._cor[0] + (self._cor_alvo[0] - self._cor[0]) * 0.05,
+            self._cor[1] + (self._cor_alvo[1] - self._cor[1]) * 0.05,
+            self._cor[2] + (self._cor_alvo[2] - self._cor[2]) * 0.05,
+        )
+        vel = {ESTADO_STANDBY:0.3, ESTADO_OUVINDO:0.8, ESTADO_PROCESSANDO:1.5, ESTADO_FALANDO:1.2}.get(self._estado, 0.3)
+        self.rotation  += vel
+        self.rotation2 -= vel * 0.7
+        self.pulse     += 0.06
+        amp = {ESTADO_STANDBY:0.02, ESTADO_OUVINDO:0.06, ESTADO_PROCESSANDO:0.08, ESTADO_FALANDO:0.12}.get(self._estado, 0.02)
+        factor = 1.0 + math.sin(self.pulse) * amp
         for p in self.pontos_plexus:
-            p['pos'] = [v * factor for v in p['orig']]
+            p["pos"] = [v * factor for v in p["orig"]]
         self.update()
 
     def initializeGL(self):
-        glClearColor(0.0, 0.0, 0.0, 1.0)
+        glClearColor(0,0,0,1)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
@@ -168,173 +194,392 @@ class SiriusNexus3DView(QOpenGLWidget):
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
-        glTranslatef(0.0, 0.0, -9.0)
+        glTranslatef(0,0,-9)
+        cor = self._cor
 
         glPushMatrix()
         glRotatef(self.rotation, 0, 1, 0)
-        glRotatef(self.rotation * 0.5, 1, 0, 0)
-
-        cor = self.COR_BRANCO if self._esta_falando else self.COR_NEON_AZUL
-
+        glRotatef(self.rotation * 0.4, 1, 0, 0)
         glBegin(GL_LINES)
-        for i in range(0, len(self.pontos_plexus), 12):
-            p1 = self.pontos_plexus[i]['pos']
-            for j in range(i + 1, i + 30):
-                if j < len(self.pontos_plexus):
-                    p2   = self.pontos_plexus[j]['pos']
-                    dist = math.dist(p1, p2)
-                    if dist < 0.8:
-                        alpha = (1.0 - dist / 0.8) * (0.4 if self._esta_falando else 0.18)
-                        glColor4f(*cor, alpha)
-                        glVertex3f(*p1)
-                        glVertex3f(*p2)
+        for i in range(0, len(self.pontos_plexus), 10):
+            p1 = self.pontos_plexus[i]["pos"]
+            for j in range(i+1, min(i+25, len(self.pontos_plexus))):
+                p2   = self.pontos_plexus[j]["pos"]
+                dist = math.dist(p1, p2)
+                if dist < 0.75:
+                    alpha = (1.0 - dist/0.75) * 0.22
+                    glColor4f(*cor, alpha)
+                    glVertex3f(*p1)
+                    glVertex3f(*p2)
         glEnd()
-
-        glPointSize(2.0)
+        glPointSize(1.8)
         glBegin(GL_POINTS)
         for p in self.pontos_plexus:
-            glColor4f(*cor, 0.5)
-            glVertex3f(*p['pos'])
+            glColor4f(*cor, 0.45)
+            glVertex3f(*p["pos"])
         glEnd()
         glPopMatrix()
 
+        glPushMatrix()
+        glRotatef(self.rotation * 1.2, 0, 0, 1)
+        glRotatef(25, 1, 0, 0)
+        glLineWidth(1.5)
+        glBegin(GL_LINE_LOOP)
+        for pt in self.anel1:
+            glColor4f(*cor, 0.5 + 0.2*math.sin(self.pulse))
+            glVertex3f(*pt)
+        glEnd()
+        glLineWidth(1.0)
+        glPopMatrix()
+
+        glPushMatrix()
+        glRotatef(self.rotation2, 1, 0, 0)
+        glRotatef(60, 0, 1, 0)
+        glBegin(GL_LINE_LOOP)
+        for pt in self.anel2:
+            glColor4f(*cor, 0.35 + 0.1*math.cos(self.pulse*1.3))
+            glVertex3f(*pt)
+        glEnd()
+        glPopMatrix()
+
+        pulso = 0.6 + 0.3*abs(math.sin(self.pulse*1.5))
+        glPointSize(2.5)
         glBegin(GL_POINTS)
-        for p_core in self.pontos_nucleo:
-            glColor4f(*cor, random.uniform(0.4, 0.9))
-            glVertex3f(*p_core)
+        for p in self.pontos_nucleo:
+            b = random.uniform(pulso-0.1, pulso+0.1)
+            glColor4f(*cor, b)
+            glVertex3f(*p)
         glEnd()
 
     def resizeGL(self, w, h):
+        if h == 0: h = 1
         glViewport(0, 0, w, h)
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        gluPerspective(45, (w / h), 0.1, 50.0)
+        gluPerspective(45, w/h, 0.1, 50.0)
         glMatrixMode(GL_MODELVIEW)
 
 
-# ---------------------------------------------------------------------------
-# Janela principal — usada como base pelo main_residente.py
-# ---------------------------------------------------------------------------
+class BarraStatus(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(36)
+        self.setStyleSheet(f"QFrame {{ background: rgba(0,10,20,220); border-bottom: 1px solid {COR_CINZA}; }}")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(20)
+        fonte = QFont("Consolas", 9)
+
+        lbl_nome = QLabel("S.I.R.I.U.S.")
+        lbl_nome.setFont(QFont("Consolas", 9, QFont.Bold))
+        lbl_nome.setStyleSheet(f"color: {COR_AZUL_NEON}; letter-spacing: 3px;")
+
+        self.lbl_cpu   = self._lbl(fonte, "CPU --")
+        self.lbl_ram   = self._lbl(fonte, "RAM --")
+        self.lbl_hora  = self._lbl(fonte, "--:--:--")
+        self.lbl_conta = self._lbl(fonte, "")
+        self.lbl_estado = QLabel(ESTADO_STANDBY)
+        self.lbl_estado.setFont(QFont("Consolas", 8, QFont.Bold))
+        self.lbl_estado.setStyleSheet(f"color: {COR_AZUL_NEON}; letter-spacing: 2px;")
+
+        layout.addWidget(lbl_nome)
+        layout.addWidget(self._sep())
+        layout.addWidget(self.lbl_cpu)
+        layout.addWidget(self.lbl_ram)
+        layout.addWidget(self._sep())
+        layout.addWidget(self.lbl_conta)
+        layout.addStretch()
+        layout.addWidget(self.lbl_hora)
+        layout.addWidget(self._sep())
+        layout.addWidget(self.lbl_estado)
+
+        t = QTimer()
+        t.timeout.connect(self._atualizar)
+        t.start(1000)
+        self._timer = t
+        self._atualizar()
+
+    def _lbl(self, fonte, txt):
+        l = QLabel(txt)
+        l.setFont(fonte)
+        l.setStyleSheet(f"color: {COR_TEXTO_HORA};")
+        return l
+
+    def _sep(self):
+        s = QLabel("│")
+        s.setStyleSheet(f"color: {COR_CINZA};")
+        return s
+
+    def _atualizar(self):
+        self.lbl_hora.setText(datetime.now().strftime("%H:%M:%S"))
+        try:
+            import psutil
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+            self.lbl_cpu.setText(f"CPU {cpu:.0f}%")
+            self.lbl_ram.setText(f"RAM {ram:.0f}%")
+            self.lbl_cpu.setStyleSheet(f"color: {COR_AMARELO if cpu>80 else COR_TEXTO_HORA};")
+            self.lbl_ram.setStyleSheet(f"color: {COR_AMARELO if ram>85 else COR_TEXTO_HORA};")
+        except Exception:
+            pass
+
+    def set_estado(self, estado: str):
+        cores = {ESTADO_STANDBY:COR_AZUL_NEON, ESTADO_OUVINDO:COR_VERDE,
+                 ESTADO_PROCESSANDO:COR_AMARELO, ESTADO_FALANDO:COR_BRANCO}
+        cor = cores.get(estado, COR_AZUL_NEON)
+        self.lbl_estado.setText(estado)
+        self.lbl_estado.setStyleSheet(f"color: {cor}; letter-spacing: 2px;")
+
+    def set_conta(self, nome: str):
+        if nome and nome != "chefia":
+            self.lbl_conta.setText(f"● {nome.upper()}")
+            self.lbl_conta.setStyleSheet(f"color: {COR_VERDE};")
+        else:
+            self.lbl_conta.setText("")
+
+
+class IndicadorEstado(QLabel):
+    _TEXTOS = {
+        ESTADO_STANDBY:     ("AGUARDANDO", COR_AZUL_NEON),
+        ESTADO_OUVINDO:     ("● OUVINDO",  COR_VERDE),
+        ESTADO_PROCESSANDO: ("◆ PROCESSANDO", COR_AMARELO),
+        ESTADO_FALANDO:     ("▶ FALANDO",  COR_BRANCO),
+    }
+    def __init__(self, parent=None):
+        super().__init__("AGUARDANDO", parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFont(QFont("Consolas", 11, QFont.Bold))
+        self.setStyleSheet(f"color: {COR_AZUL_NEON}; letter-spacing: 6px; background: transparent;")
+        self.setFixedHeight(30)
+
+    def set_estado(self, estado: str):
+        texto, cor = self._TEXTOS.get(estado, ("AGUARDANDO", COR_AZUL_NEON))
+        self.setText(texto)
+        self.setStyleSheet(f"color: {cor}; letter-spacing: 6px; background: transparent;")
+
+
+class PainelChat(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"QFrame {{ background: rgba(2,12,24,235); border-top: 1px solid {COR_CINZA}; }}")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        self.chat = QTextEdit()
+        self.chat.setReadOnly(True)
+        self.chat.setFont(QFont("Consolas", 11))
+        self.chat.setStyleSheet(f"""
+            QTextEdit {{ background: transparent; border: none; color: {COR_AZUL_NEON}; }}
+            QScrollBar:vertical {{ background: #0a1a2a; width: 6px; border-radius: 3px; }}
+            QScrollBar::handle:vertical {{ background: {COR_CINZA}; border-radius: 3px; }}
+        """)
+        self.chat.setMinimumHeight(110)
+
+        linha = QHBoxLayout()
+        linha.setSpacing(8)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Comando ou mensagem...")
+        self.input.setFont(QFont("Consolas", 11))
+        self.input.setStyleSheet(f"""
+            QLineEdit {{ background: rgba(93,226,255,0.04); border: 1px solid {COR_CINZA};
+                         border-radius: 6px; color: white; padding: 8px 14px; }}
+            QLineEdit:focus {{ border: 1px solid {COR_AZUL_NEON}; background: rgba(93,226,255,0.07); }}
+        """)
+        self.btn_enviar = QPushButton("ENVIAR")
+        self.btn_enviar.setFixedSize(80, 36)
+        self.btn_enviar.setFont(QFont("Consolas", 9, QFont.Bold))
+        self.btn_enviar.setCursor(Qt.PointingHandCursor)
+        self.btn_enviar.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {COR_AZUL_NEON};
+                           border: 1px solid {COR_AZUL_NEON}; border-radius: 6px; letter-spacing: 1px; }}
+            QPushButton:hover {{ background: rgba(93,226,255,0.12); }}
+        """)
+        linha.addWidget(self.input)
+        linha.addWidget(self.btn_enviar)
+        layout.addWidget(self.chat)
+        layout.addLayout(linha)
+
+    def _fmt_hora(self):
+        return datetime.now().strftime("%H:%M")
+
+    def log_usuario(self, txt: str):
+        self.chat.append(
+            f"<p style=\'margin:3px 0; font-family:Consolas;\'>"
+            f"<span style=\'color:{COR_TEXTO_HORA};\'>[{self._fmt_hora()}]</span> "
+            f"<span style=\'color:white; font-weight:bold;\'>▷ VOCÊ:</span> "
+            f"<span style=\'color:white;\'>{txt}</span></p>"
+        )
+        self._scroll()
+
+    def log_sirius(self, txt: str):
+        self.chat.append(
+            f"<p style=\'margin:3px 0; font-family:Consolas;\'>"
+            f"<span style=\'color:{COR_TEXTO_HORA};\'>[{self._fmt_hora()}]</span> "
+            f"<span style=\'color:{COR_AZUL_NEON}; font-weight:bold;\'>◆ SIRIUS:</span> "
+            f"<span style=\'color:{COR_AZUL_NEON};\'>{txt}</span></p>"
+        )
+        self._scroll()
+
+    def log_sistema(self, txt: str):
+        self.chat.append(
+            f"<p style=\'margin:3px 0; font-family:Consolas;\'>"
+            f"<span style=\'color:{COR_TEXTO_HORA};\'>[{self._fmt_hora()}]</span> "
+            f"<span style=\'color:{COR_AMARELO};\'>{txt}</span></p>"
+        )
+        self._scroll()
+
+    def _scroll(self):
+        self.chat.verticalScrollBar().setValue(self.chat.verticalScrollBar().maximum())
+
+
+# BotaoMic removido — mic sempre ativo
+
 
 class SiriusInterfaceMainWindow(QMainWindow):
+    _log_sistema_signal = Signal(str)
+
     def __init__(self, cerebro=None):
         super().__init__()
-        # ✅ FIX: cerebro injetado — não instancia SiriusCerebro aqui
-        # Se usado standalone (if __name__ == "__main__"), cria o próprio
         if cerebro is None:
             from cerebro import SiriusCerebro
             cerebro = SiriusCerebro()
         self._cerebro = cerebro
 
-        self.setWindowTitle("S.I.R.I.U.S. - Core Interface")
-        self.resize(600, 800)
-        self.setStyleSheet("background-color: #000000;")
+        self.setWindowTitle("S.I.R.I.U.S.")
+        self.resize(640, 820)
+        self.setMinimumSize(560, 700)
+        self.setStyleSheet(f"background-color: {COR_FUNDO};")
 
-        self.main_widget   = QWidget()
-        self.setCentralWidget(self.main_widget)
-        self.layout_master = QVBoxLayout(self.main_widget)
-        self.layout_master.setContentsMargins(0, 0, 0, 0)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.barra_status = BarraStatus()
+        root.addWidget(self.barra_status)
 
         self.core_view = SiriusNexus3DView()
-        self.layout_master.addWidget(self.core_view)
+        self.core_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root.addWidget(self.core_view)
 
-        # Botão de alternância
-        self.btn_toggle = QPushButton("TEXTO", self.core_view)
-        self.btn_toggle.setGeometry(480, 20, 100, 35)
-        self.btn_toggle.setCursor(Qt.PointingHandCursor)
-        self.btn_toggle.setStyleSheet(
-            "QPushButton { background: rgba(0,0,0,180); color: #5DE2FF; border: 1px solid #5DE2FF; "
-            "border-radius: 8px; font-weight: bold; } "
-            "QPushButton:hover { background: rgba(93, 226, 255, 0.2); }"
-        )
-        self.btn_toggle.clicked.connect(self.alternar_interface)
+        self.indicador = IndicadorEstado()
+        root.addWidget(self.indicador)
 
-        # Painel de chat
-        self.hud_chat = QFrame()
-        self.hud_chat.setFixedHeight(300)
-        self.hud_chat.setStyleSheet(
-            "QFrame { background-color: rgba(5, 5, 5, 240); border-top: 2px solid #5DE2FF; "
-            "border-top-left-radius: 30px; border-top-right-radius: 30px; }"
-        )
-        self.hud_chat.setVisible(False)
-        self.layout_master.addWidget(self.hud_chat)
+        linha_ctrl = QWidget()
+        linha_ctrl.setFixedHeight(48)
+        linha_ctrl.setStyleSheet("background: rgba(0,10,20,200);")
+        lc = QHBoxLayout(linha_ctrl)
+        lc.setContentsMargins(16, 6, 16, 6)
+        lc.setSpacing(8)
 
-        layout_chat       = QVBoxLayout(self.hud_chat)
-        self.chat_history = QTextEdit()
-        self.chat_history.setReadOnly(True)
-        self.chat_history.setStyleSheet(
-            "background: transparent; color: #5DE2FF; border: none; "
-            "font-size: 14px; font-family: 'Consolas';"
-        )
-        self.input_texto = QLineEdit()
-        self.input_texto.setPlaceholderText("Digite seu comando ou converse...")
-        self.input_texto.setStyleSheet(
-            "QLineEdit { background: rgba(93, 226, 255, 0.05); border: 1px solid #5DE2FF; "
-            "border-radius: 15px; color: white; padding: 12px; }"
-        )
-        self.input_texto.returnPressed.connect(self.enviar_texto_manual)
-        layout_chat.addWidget(self.chat_history)
-        layout_chat.addWidget(self.input_texto)
+        # Botão de mostrar/esconder teclado (input)
+        self.btn_teclado = QPushButton("⌨  TECLADO")
+        self.btn_teclado.setFixedSize(120, 36)
+        self.btn_teclado.setFont(QFont("Consolas", 9, QFont.Bold))
+        self.btn_teclado.setCursor(Qt.PointingHandCursor)
+        self.btn_teclado.setCheckable(True)
+        self.btn_teclado.setChecked(True)  # começa visível
+        self.btn_teclado.toggled.connect(self._toggle_teclado)
+        self.btn_teclado.setStyleSheet(f"""
+            QPushButton {{ background: rgba(93,226,255,0.06); color: {COR_AZUL_NEON};
+                           border: 1px solid {COR_AZUL_NEON}; border-radius: 6px; letter-spacing: 1px; }}
+            QPushButton:hover {{ background: rgba(93,226,255,0.15); }}
+            QPushButton:checked {{ background: rgba(93,226,255,0.06); }}
+            QPushButton:!checked {{ color: {COR_CINZA}; border-color: {COR_CINZA};
+                                    background: transparent; }}
+        """)
 
-        # Worker único com o cerebro injetado
+        btn_limpar = QPushButton("LIMPAR")
+        btn_limpar.setFixedSize(80, 36)
+        btn_limpar.setFont(QFont("Consolas", 9))
+        btn_limpar.setCursor(Qt.PointingHandCursor)
+        btn_limpar.clicked.connect(lambda: self.painel_chat.chat.clear())
+        btn_limpar.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {COR_CINZA};
+                           border: 1px solid {COR_CINZA}; border-radius: 6px; }}
+            QPushButton:hover {{ color: {COR_AZUL_NEON}; border-color: {COR_AZUL_NEON}; }}
+        """)
+        lc.addWidget(self.btn_teclado)
+        lc.addStretch()
+        lc.addWidget(btn_limpar)
+        root.addWidget(linha_ctrl)
+
+        self.painel_chat = PainelChat()
+        self.painel_chat.setFixedHeight(280)
+        self.painel_chat.input.returnPressed.connect(self._enviar_texto)
+        self.painel_chat.btn_enviar.clicked.connect(self._enviar_texto)
+        root.addWidget(self.painel_chat)
+
         self.worker = SiriusWorker(SiriusAudio(), self._cerebro)
-        self.worker.comando_detectado.connect(self.log_usuario)
-        self.worker.resposta_pronta.connect(self.log_sirius)
-        self.worker.status_fala.connect(self.set_fala_view)
+        self.worker.comando_detectado.connect(self.painel_chat.log_usuario)
+        self.worker.resposta_pronta.connect(self.painel_chat.log_sirius)
+        self.worker.estado_mudou.connect(self._on_estado)
         self.worker.start()
 
-        # Injeta callbacks no módulo proativo
-        # O proativo fala em voz + aparece no chat sem o usuário perguntar nada
-        if hasattr(self._cerebro, '_proativo') and self._cerebro._proativo:
+        self._log_sistema_signal.connect(self.painel_chat.log_sistema)
+
+        if hasattr(self._cerebro, "_proativo") and self._cerebro._proativo:
             self._cerebro._proativo.registrar_callback(
                 callback_falar=self.worker.audio.falar,
-                callback_log=self.log_sirius,
+                callback_log=self._log_sistema_signal.emit,
             )
-        # Compatibilidade com cerebro.registrar_callback_fala
-        if hasattr(self._cerebro, 'registrar_callback_fala'):
-            self._cerebro.registrar_callback_fala(self.worker.audio.falar)
+        if hasattr(self._cerebro, "registrar_callback"):
+            self._cerebro.registrar_callback(
+                callback_falar=self.worker.audio.falar,
+                callback_log=self._log_sistema_signal.emit,
+            )
 
-    def set_fala_view(self, status: bool):
-        self.core_view.esta_falando = status
+        QTimer.singleShot(800, self._boas_vindas)
+        QTimer.singleShot(500, self._atualizar_conta)
 
-    def alternar_interface(self):
-        visivel = self.hud_chat.isVisible()
-        self.hud_chat.setVisible(not visivel)
-        self.worker.modo_voz_ativo = visivel  # voz OFF quando painel aberto
-        if visivel:
-            with self.worker.lock:
-                self.worker.comando_manual = None
-        self.btn_toggle.setText("VOZ" if not visivel else "TEXTO")
-        if not visivel:
-            self.input_texto.setFocus()
+    def _on_estado(self, estado: str):
+        self.core_view.set_estado(estado)
+        self.barra_status.set_estado(estado)
+        self.indicador.set_estado(estado)
 
-    def enviar_texto_manual(self):
-        t = self.input_texto.text().strip()
+    def _enviar_texto(self):
+        t = self.painel_chat.input.text().strip()
         if t:
             self.worker.enviar_comando_texto(t)
-            self.input_texto.clear()
-            self.input_texto.setFocus()
+            self.painel_chat.input.clear()
+            self.painel_chat.input.setFocus()
 
-    def log_usuario(self, t: str):
-        self.chat_history.append(f"<p style='color:white; margin:5px;'><b>👤 Você:</b> {t}</p>")
-        self.chat_history.verticalScrollBar().setValue(
-            self.chat_history.verticalScrollBar().maximum()
-        )
+    def _atualizar_conta(self):
+        try:
+            if hasattr(self._cerebro, "_sessao") and self._cerebro._sessao:
+                nome = self._cerebro._sessao.nome_usuario
+            elif hasattr(self._cerebro, "_perfil") and self._cerebro._perfil:
+                nome = self._cerebro._perfil.get("nome", "")
+            else:
+                nome = ""
+            self.barra_status.set_conta(nome)
+        except Exception:
+            pass
 
-    def log_sirius(self, t: str):
-        self.chat_history.append(f"<p style='color:#5DE2FF; margin:5px;'><b>🤖 SIRIUS:</b> {t}</p>")
-        self.chat_history.verticalScrollBar().setValue(
-            self.chat_history.verticalScrollBar().maximum()
-        )
+    def _boas_vindas(self):
+        h = datetime.now().hour
+        s = "Bom dia" if h < 12 else "Boa tarde" if h < 18 else "Boa noite"
+        self.painel_chat.log_sistema(f"◆ Sistemas operacionais. {s}. Aguardando comandos.")
+
+    # compatibilidade legado
+    def log_sirius(self, t: str):   self.painel_chat.log_sirius(t)
+    def log_usuario(self, t: str):  self.painel_chat.log_usuario(t)
+    def set_fala_view(self, v: bool): self._on_estado(ESTADO_FALANDO if v else ESTADO_STANDBY)
+
+    def _toggle_teclado(self, visivel: bool):
+        """Mostra/esconde a linha de input (campo texto + botão ENVIAR)."""
+        self.painel_chat.input.setVisible(visivel)
+        self.painel_chat.btn_enviar.setVisible(visivel)
+        # Ajusta altura do painel: com teclado 280, sem teclado 220
+        self.painel_chat.setFixedHeight(280 if visivel else 210)
+        self.btn_teclado.setText("⌨  TECLADO" if visivel else "⌨  OCULTO")
 
     def closeEvent(self, event):
         self.worker.parar()
         event.accept()
 
-
-# ---------------------------------------------------------------------------
-# Standalone
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     app    = QApplication(sys.argv)

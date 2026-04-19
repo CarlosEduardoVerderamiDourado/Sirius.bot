@@ -2,15 +2,22 @@ import sqlite3
 import os
 
 class SiriusMemory:
-    def __init__(self):
+    def __init__(self, db_pessoal: str = None):
+        """
+        db_pessoal: caminho do banco pessoal.
+        Se None, usa o banco padrão (sirius_pessoal.db).
+        Passado pelo SiriusContas para isolar dados por conta.
+        """
         diretorio_src = os.path.dirname(os.path.abspath(__file__))
         diretorio_raiz = os.path.dirname(diretorio_src)
         
         caminho_data = os.path.join(diretorio_raiz, "data")
         if not os.path.exists(caminho_data):
             os.makedirs(caminho_data)
-        self.db_pessoal = os.path.join(caminho_data, "sirius_pessoal.db")
-        self.db_treino = os.path.join(caminho_data, "sirius_treino.db")
+
+        # Usa banco fornecido ou o padrão
+        self.db_pessoal = db_pessoal or os.path.join(caminho_data, "sirius_pessoal.db")
+        self.db_treino  = os.path.join(caminho_data, "sirius_treino.db")
         
         self.inicializar_bancos()
 

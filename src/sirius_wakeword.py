@@ -45,29 +45,29 @@ MODELO_BUILTIN = "hey_jarvis"
 
 # Palavras que o Whisper fallback deve reconhecer como wake word
 # Inclui TODAS as variantes fonéticas vistas nos logs do Whisper Tiny
-# Variantes fonéticas REAIS de "sirius" para o Whisper fallback.
-# IMPORTANTE: nao coloque palavras comuns aqui (ex: "filhos", "seguiu")
-# pois o match é feito por substring e causam falsos positivos.
-# Só inclua variantes que soam MUITO parecidas com "sirius".
+# Variantes fonéticas que o Whisper Tiny REALMENTE confunde com "sirius".
+# REGRAS:
+#   1. Sem palavras que aparecem em frases normais ("filhos", "seguiu", "see you")
+#   2. Sem palavras curtas demais (< 5 letras) — falso positivo muito alto
+#   3. O check é por PALAVRA INTEIRA (\b), não substring
+#   4. Palavras compostas ("ei sirius") têm check exato por substring
 WAKE_WORDS_SIRIUS = {
-    # Corretas
+    # Grafias corretas
     "sirius", "sírius", "siriuz",
-    # Variantes fonéticas confirmadas do Whisper Tiny
+    # Variantes fonéticas confirmadas nos logs (soam genuinamente como "sirius")
     "serios", "sérios", "cedios", "fidios",
     "fírios", "fibios", "firius", "fírius",
     "sídios", "seídios",
-    # Com prefixos — palavras compostas que incluem "sirius"
+    # Com prefixos — busca substring exata (contêm "sirius")
     "ei sirius", "oi sirius", "hey sirius",
     "ei serios", "oi serios",
+    # REMOVIDOS PROPOSITALMENTE:
+    #   "serious"  → ativa em "estou seriamente cansado"
+    #   "filhos"   → ativa em "tenho dois filhos"
+    #   "seguiu"   → ativa em "ele seguiu em frente"
+    #   "see you"  → ativa em qualquer despedida em inglês
+    #   "jarvis"   → ativa em filmes/séries
 }
-
-# Palavras removidas propositalmente para evitar falsos positivos:
-#   "serious"  → ativa em "estou seriamente cansado"
-#   "filhos"   → ativa em "tenho dois filhos"
-#   "seguiu"   → ativa em "ele seguiu em frente"
-#   "see you"  → ativa em frases em inglês comuns
-#   "jarvis"   → muito genérico, ativa em conteúdo de filmes/séries
-#   "hey jarvis" → idem
 
 # Sensibilidade: 0.0 (muitos falsos positivos) a 1.0 (muito restrito)
 # 0.5 é um bom equilíbrio
@@ -76,6 +76,38 @@ SENSIBILIDADE = 0.5
 # Taxa de amostragem exigida pelo openWakeWord
 SAMPLE_RATE   = 16000
 CHUNK_SIZE    = 1280  # 80ms de áudio por frame
+
+
+# ---------------------------------------------------------------------------
+# Verificação de wake word por palavra inteira (não substring)
+# ---------------------------------------------------------------------------
+
+def _contem_wake_word(texto: str) -> bool:
+    """
+    Verifica se o texto contém uma wake word por PALAVRA INTEIRA.
+
+    Por que isso importa:
+      - Substring: "serios" ativa em "estou seriamente cansado" → FALSO POSITIVO
+      - Palavra inteira: "serios" só ativa se for uma palavra separada → CORRETO
+
+    Para termos compostos ("ei sirius"), usa busca substring exata
+    porque já são específicos o suficiente.
+    """
+    import re as _re
+    t = texto.lower().strip()
+
+    for ww in WAKE_WORDS_SIRIUS:
+        if " " in ww:
+            # Termo composto — busca exata por substring
+            if ww in t:
+                return True
+        else:
+            # Palavra única — exige borda de palavra \b
+            if _re.search(r"\b" + _re.escape(ww) + r"\b", t):
+                return True
+
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Detector de wake word — openWakeWord (principal)
@@ -226,9 +258,12 @@ class SiriusWakeWord:
 
         RATE      = 16000
         CHUNK     = 1024
-        SEGUNDOS  = 1.5
+        # 2.0s por janela — suficiente para capturar "Sirius" completo
+        # com margem para início e fim da fala (1.5s era muito curto)
+        SEGUNDOS  = 2.0
         N_FRAMES  = int(RATE / CHUNK * SEGUNDOS)
-        THRESHOLD = 300
+        # Threshold de energia — descarta silêncio e ruído de fundo leve
+        THRESHOLD = 350
 
         print("\033[92m[WAKEWORD]: Ouvindo 'Sirius' com modelo MFCC (~3% CPU)...\033[0m")
 
@@ -272,11 +307,12 @@ class SiriusWakeWord:
                 pred     = self._clf_pkl.predict(feat_s)[0]
                 prob     = self._clf_pkl.predict_proba(feat_s)[0][1]
 
-                # Threshold alto (0.92) para evitar falsos positivos.
-                # O modelo MFCC foi treinado com fala sintetica como negativo —
-                # isso causa falsos positivos com voz humana real.
-                # Solucao definitiva: grave negativos reais (veja --so-treinar).
-                if pred == 1 and prob > 0.92:
+                # Threshold 0.88: valor calibrado empiricamente.
+                # 0.75 causava muitos falsos positivos porque o modelo
+                # foi treinado com ruído sintético como negativo — qualquer
+                # voz humana tem score alto. 0.88 reduz sem eliminar detecção.
+                # Solução definitiva: gravar negativos reais (--gravar-negativos).
+                if pred == 1 and prob > 0.88:
                     agora = time.time()
                     if agora - self._ultima_deteccao >= self._cooldown:
                         self._ultima_deteccao = agora
@@ -414,25 +450,12 @@ class SiriusWakeWord:
                 if texto:
                     print(f"\033[90m[WAKEWORD DEBUG]: ouvido: '{texto[:40]}'\033[0m")
 
-                    # Verifica palavra INTEIRA — evita falsos positivos por substring
-                    def _contem_wake_word(t, wake_words):
-                        import re as _re
-                        for ww in wake_words:
-                            if " " in ww:
-                                if ww in t:
-                                    return True, ww
-                            else:
-                                if _re.search(r"\b" + _re.escape(ww) + r"\b", t):
-                                    return True, ww
-                        return False, None
-
-                    detectou, palavra = _contem_wake_word(texto, WAKE_WORDS_SIRIUS)
-                    if detectou:
+                    if _contem_wake_word(texto):
                         agora = time.time()
                         if agora - self._ultima_deteccao >= self._cooldown:
                             self._ultima_deteccao = agora
                             self._deteccoes      += 1
-                            print(f"\033[92m[WAKEWORD]: 'Sirius' detectado via '{palavra}'! ({self._deteccoes}x)\033[0m")
+                            print(f"\033[92m[WAKEWORD]: 'Sirius' detectado via Whisper! ({self._deteccoes}x)\033[0m")
                             self._ao_detectar()
 
             except Exception as e:
@@ -512,6 +535,7 @@ class SiriusWakeWord:
             "modelo":      CAMINHO_MODELO_CUSTOM if os.path.exists(CAMINHO_MODELO_CUSTOM) else MODELO_BUILTIN,
         }
 
+
 # ---------------------------------------------------------------------------
 # Treinador de wake word personalizada
 # ---------------------------------------------------------------------------
@@ -538,7 +562,13 @@ class TreinadorWakeWord:
         os.makedirs(self.caminho_audio, exist_ok=True)
 
     def gravar_amostras(self, n_repeticoes: int = 50):
-        """Grava N repetições de cada frase de ativação."""
+        """
+        Grava N repetições de frases de ativação.
+
+        IMPORTANTE: As frases NÃO contêm "Sirius" para evitar que a
+        própria wake word dispare durante a gravação de amostras.
+        O modelo aprende o padrão vocal geral — não a palavra exata.
+        """
         try:
             import pyaudio
             import wave
@@ -547,47 +577,82 @@ class TreinadorWakeWord:
             return False
 
         pa = pyaudio.PyAudio()
-        print(f"\n{'='*50}")
+        print(f"\n{'='*55}")
         print("  GRAVAÇÃO DE WAKE WORD PERSONALIZADA")
-        print(f"{'='*50}")
-        print(f"  Vamos gravar {n_repeticoes} repetições de cada frase.")
-        print(f"  Fale naturalmente, em volume normal.\n")
+        print(f"{'='*55}")
+        print("  Você vai gravar frases curtas para ensinar o Sirius")
+        print("  a reconhecer SUA voz.")
+        print()
+        print("  IMPORTANTE: As frases abaixo NÃO contêm a palavra 'Sirius'")
+        print("  para evitar que a wake word dispare durante a gravação.")
+        print("  O modelo aprende o padrão vocal do início de 'Si-ri-us'.")
+        print()
 
-        total_gravados = 0
-        for frase in self.FRASES:
+        # Frases que soam similar à fonética de "Sirius" mas não ativam a wake word
+        # Foco nos sons "si", "ri", "us" — a sequência que distingue "sirius"
+        FRASES = [
+            "si ri us",           # fonética separada
+            "sistema ativo",      # começa com "si"
+            "visível agora",      # "si" no meio
+            "rio azul",           # "ri"
+            "música boa",         # "si" + vogal
+            "ativar sistema",     # "si"
+        ]
+        SEGUNDOS_POR_AMOSTRA = 2.0
+        RATE     = SAMPLE_RATE
+        CHUNK    = 1024
+        N_FRAMES = int(RATE / CHUNK * SEGUNDOS_POR_AMOSTRA)
+
+        os.makedirs(self.caminho_audio, exist_ok=True)
+        total_gravado = 0
+
+        for frase in FRASES:
             print(f"\n  Frase: '{frase}'")
+            print(f"  Repita {n_repeticoes} vezes. Cada gravação = {SEGUNDOS_POR_AMOSTRA:.0f}s.")
+            input("  [Enter para começar]")
+
             for i in range(n_repeticoes):
-                input(f"    [{i+1}/{n_repeticoes}] Pressione Enter e diga '{frase}'... ")
+                print(f"  Gravando {i+1}/{n_repeticoes}... fale agora!", end="\r")
+                try:
+                    stream = pa.open(
+                        format=pyaudio.paInt16, channels=1,
+                        rate=RATE, input=True, frames_per_buffer=CHUNK
+                    )
+                    frames = [stream.read(CHUNK, exception_on_overflow=False)
+                              for _ in range(N_FRAMES)]
+                    stream.stop_stream()
+                    stream.close()
 
-                stream = pa.open(
-                    format=pyaudio.paInt16, channels=1,
-                    rate=SAMPLE_RATE, input=True,
-                    frames_per_buffer=CHUNK_SIZE
-                )
+                    nome = f"amostra_{frase.replace(' ', '_')}_{i:04d}.wav"
+                    caminho_out = os.path.join(self.caminho_audio, nome)
+                    with wave.open(caminho_out, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+                        wf.setframerate(RATE)
+                        wf.writeframes(b"".join(frames))
 
-                frames = []
-                # Grava 1.5 segundos
-                for _ in range(int(SAMPLE_RATE / CHUNK_SIZE * 1.5)):
-                    frames.append(stream.read(CHUNK_SIZE, exception_on_overflow=False))
-                stream.stop_stream()
-                stream.close()
+                    total_gravado += 1
+                    time.sleep(0.1)
+                except Exception as e:
+                    print(f"\n  Erro: {e}")
+                    continue
 
-                nome_arquivo = os.path.join(
-                    self.caminho_audio,
-                    f"{frase.replace(' ', '_')}_{i:03d}.wav"
-                )
-                with wave.open(nome_arquivo, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes(b"".join(frames))
-
-                total_gravados += 1
-                print(f"    ✓ Gravado")
+            print(f"  ✓ {n_repeticoes} amostras de '{frase}' gravadas.")
 
         pa.terminate()
-        print(f"\n  {total_gravados} amostras gravadas em {self.caminho_audio}")
-        return True
+        print(f"\n  Total: {total_gravado} amostras gravadas em {self.caminho_audio}")
+        print()
+        print("  ── PRÓXIMO PASSO: Gravar negativos reais ──────────────────")
+        pasta_neg = os.path.join(self.caminho_audio, "negativos")
+        print(f"  Crie: {pasta_neg}")
+        print("  Grave arquivos .wav de você falando qualquer coisa")
+        print("  EXCETO as frases acima. Ex: 'abre o chrome', 'que horas são'")
+        print("  Quanto mais negativos reais, menos falsos positivos.")
+        print()
+        print("  Depois rode: python sirius_wakeword.py --so-treinar")
+        print(f"{'='*55}\n")
+        return total_gravado > 0
+
 
     def treinar(self):
         """
@@ -712,91 +777,38 @@ class TreinadorWakeWord:
 
     def _treinar_simples(self, arquivos_wav: list) -> bool:
         """
-        Treino MFCC + sklearn com amostras negativas REAIS de fala.
-
-        O problema do treino anterior: negativos eram ruído puro (0.01 amplitude).
-        Qualquer fala real tem muito mais energia → sempre classificava como positivo.
-
-        Solução: gerar negativos com características de fala real (energia, variação
-        espectral) ou gravar o usuário dizendo palavras aleatórias.
+        Método de treino alternativo — usa MFCC + sklearn puro.
+        Não depende de openWakeWord internals. Menos preciso mas funcional.
         """
-        print("[TREINO]: Usando método MFCC + sklearn com negativos realistas...")
+        print("[TREINO]: Usando método alternativo (MFCC + sklearn)...")
         try:
             import numpy as np
             import wave
             import pickle
             from sklearn.linear_model import LogisticRegression
             from sklearn.preprocessing import StandardScaler
-            from sklearn.model_selection import cross_val_score
         except ImportError as e:
             print(f"pip install scikit-learn: {e}")
             return False
 
         def extrair_mfcc_simples(audio: np.ndarray, n_mfcc: int = 20) -> np.ndarray:
             """MFCC simplificado sem librosa."""
-            frame_size = 512
-            hop_size   = 256
+            frame_size  = 512
+            hop_size    = 256
             frames = []
             for i in range(0, len(audio) - frame_size, hop_size):
                 frame = audio[i:i + frame_size] * np.hamming(frame_size)
                 fft   = np.abs(np.fft.rfft(frame))
                 fft   = fft[:n_mfcc * 4]
-                banda = max(1, len(fft) // n_mfcc)
+                # Agrupa em n_mfcc bandas
+                banda = len(fft) // n_mfcc
                 feats = [np.mean(fft[j*banda:(j+1)*banda]) for j in range(n_mfcc)]
                 frames.append(feats)
             if not frames:
                 return np.zeros(n_mfcc)
             return np.mean(frames, axis=0)
 
-        def gerar_fala_sintetica(duracao_s: float = 1.5) -> np.ndarray:
-            """
-            Gera áudio sintético com características de fala humana.
-            Muito melhor que ruído branco como negativo.
-            """
-            n = int(SAMPLE_RATE * duracao_s)
-            # Formantes típicos de vogais (Hz)
-            formantes = [
-                (800,  150),   # F1 vogal aberta
-                (1200, 200),   # F2
-                (2500, 300),   # F3
-                (350,  100),   # vogal fechada
-                (1800, 250),
-                (2800, 350),
-            ]
-            t   = np.linspace(0, duracao_s, n)
-            sig = np.zeros(n, dtype=np.float32)
-
-            # Escolhe 3 índices aleatórios da lista de formantes
-            indices_aleatorios = np.random.choice(len(formantes), size=3, replace=False)
-            
-            for idx in indices_aleatorios:
-                f, b = formantes[idx]  # Acessa a frequência e banda usando o índice
-                
-                # Oscilação com envelope de amplitude (simula sílaba)
-                envelope = np.exp(-np.random.uniform(0.5, 3.0) * t)
-                envelope *= np.random.uniform(0.3, 1.0)
-                sig += envelope * np.sin(2 * np.pi * f * t + np.random.uniform(0, 2*np.pi)).astype(np.float32)
-
-            # Adiciona ruído de fundo leve
-            sig += np.random.randn(n).astype(np.float32) * 0.05
-
-            # Normaliza para amplitude similar à fala real
-            sig = sig / (np.abs(sig).max() + 1e-8) * np.random.uniform(0.3, 0.8)
-            return sig
-
-        def gerar_negativo_transiente(duracao_s: float = 1.5) -> np.ndarray:
-            """Gera transiente (porta batendo, teclado, etc.) como negativo."""
-            n   = int(SAMPLE_RATE * duracao_s)
-            sig = np.zeros(n, dtype=np.float32)
-            # Alguns picos aleatórios
-            for _ in range(np.random.randint(1, 5)):
-                pos = np.random.randint(0, n // 2)
-                dur = np.random.randint(100, 2000)
-                amp = np.random.uniform(0.1, 0.6)
-                sig[pos:pos+dur] += amp * np.exp(-np.linspace(0, 5, dur)) * np.random.randn(dur).astype(np.float32)
-            return sig
-
-        # ── Positivos: suas gravações de "ei sirius"
+        # Positivos
         X_pos = []
         for wav in arquivos_wav:
             try:
@@ -808,111 +820,94 @@ class TreinadorWakeWord:
             except Exception:
                 continue
 
-        if len(X_pos) < 5:
-            print("[TREINO]: Amostras positivas insuficientes.")
-            return False
-
-        n_pos = len(X_pos)
-        print(f"[TREINO]: {n_pos} amostras positivas extraídas.")
-
-        # Verifica se ha negativos reais — melhora muito a precisao
+        # Negativos de arquivo — voz humana real (melhor qualidade)
+        # Coloque .wav em config/wakeword_audio/negativos/ para usar
         pasta_neg = os.path.join(self.caminho_audio, "negativos")
-        n_neg_reais = 0
-        if os.path.exists(pasta_neg):
-            n_neg_reais = sum(1 for f in os.listdir(pasta_neg) if f.endswith(".wav"))
-        if n_neg_reais == 0:
-            print()
-            print("\033[93m[TREINO]: DICA IMPORTANTE para evitar falsos positivos:")
-            print(f"  Crie a pasta: {pasta_neg}")
-            print("  Grave voce falando qualquer coisa MENOS 'sirius'")
-            print("  Ex: 'abre o chrome', 'tudo bem', 'que horas sao', 'boa tarde'")
-            print("  Formato: .wav, 16000Hz, mono, ~2-3s cada")
-            print("  Quanto mais negativos reais, menos falsos positivos!")
-            print("  Retreine depois: python sirius_wakeword.py --so-treinar\033[0m")
-            print()
-        else:
-            print(f"[TREINO]: {n_neg_reais} negativos reais encontrados.")
-
-        # ── Negativos: mix de fala sintética + transientes + silêncio
-        X_neg = []
-
-        # 60% fala sintética (o maior problema era esse)
-        n_fala = int(n_pos * 3 * 0.6)
-        for _ in range(n_fala):
-            audio = gerar_fala_sintetica()
-            X_neg.append(extrair_mfcc_simples(audio))
-
-        # 25% transientes
-        n_trans = int(n_pos * 3 * 0.25)
-        for _ in range(n_trans):
-            audio = gerar_negativo_transiente()
-            X_neg.append(extrair_mfcc_simples(audio))
-
-        # 15% silêncio / ruído muito baixo
-        n_sil = int(n_pos * 3 * 0.15)
-        for _ in range(n_sil):
-            audio = np.random.randn(SAMPLE_RATE).astype(np.float32) * 0.005
-            X_neg.append(extrair_mfcc_simples(audio))
-
-        # Negativos de arquivo se existirem (pasta negativos/)
-        pasta_neg = os.path.join(self.caminho_audio, "negativos")
+        X_neg_arquivo = []
         if os.path.exists(pasta_neg):
             for f in os.listdir(pasta_neg):
                 if f.endswith(".wav"):
                     try:
                         with wave.open(os.path.join(pasta_neg, f), 'rb') as wf:
                             raw = wf.readframes(wf.getnframes())
-                        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                        X_neg.append(extrair_mfcc_simples(audio))
+                        audio_neg = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                        X_neg_arquivo.append(extrair_mfcc_simples(audio_neg))
                     except Exception:
                         continue
+            if X_neg_arquivo:
+                print(f"[TREINO]: {len(X_neg_arquivo)} negativos reais carregados.")
 
-        print(f"[TREINO]: {len(X_neg)} amostras negativas geradas ({n_fala} fala sintética, {n_trans} transientes, {n_sil} silêncio).")
+        # Negativos sintéticos — mix de tipos para cobrir casos reais
+        # Sem negativos reais, o modelo generaliza mal para voz humana
+        X_neg_sintetico = []
+        n_neg_alvo = max(len(X_pos) * 3, 30)
+
+        # 50% ruído cor-de-rosa (mais parecido com voz do que branco)
+        for _ in range(n_neg_alvo // 2):
+            ruido = np.cumsum(np.random.randn(SAMPLE_RATE).astype(np.float32)) * 0.001
+            ruido = ruido / (np.abs(ruido).max() + 1e-8) * 0.05
+            X_neg_sintetico.append(extrair_mfcc_simples(ruido))
+
+        # 30% fala sintética com formantes (simula vogais sem ser "sirius")
+        for _ in range(n_neg_alvo * 3 // 10):
+            t_arr  = np.linspace(0, 1.5, int(SAMPLE_RATE * 1.5))
+            # Formantes de vogal genérica (não específica de "sirius")
+            freq   = np.random.choice([400, 600, 800, 1000, 1200])
+            sinal  = np.sin(2 * np.pi * freq * t_arr).astype(np.float32)
+            sinal += np.random.randn(len(t_arr)).astype(np.float32) * 0.05
+            sinal  = sinal / (np.abs(sinal).max() + 1e-8) * 0.3
+            X_neg_sintetico.append(extrair_mfcc_simples(sinal))
+
+        # 20% silêncio com micro-ruído
+        for _ in range(n_neg_alvo // 5):
+            silencio = np.random.randn(SAMPLE_RATE).astype(np.float32) * 0.002
+            X_neg_sintetico.append(extrair_mfcc_simples(silencio))
+
+        X_neg = X_neg_arquivo + X_neg_sintetico
+        if not X_neg:
+            X_neg = X_neg_sintetico  # fallback
+
+        n_pos = len(X_pos)
+        n_neg = len(X_neg)
+        print(f"[TREINO]: {n_pos} positivos + {n_neg} negativos "
+              f"({len(X_neg_arquivo)} reais + {len(X_neg_sintetico)} sintéticos)")
 
         X = np.array(X_pos + X_neg)
-        y = np.array([1] * len(X_pos) + [0] * len(X_neg))
+        y = np.array([1] * n_pos + [0] * n_neg)
 
         scaler = StandardScaler()
         X_s    = scaler.fit_transform(X)
 
-        # Treina com regularização forte (C baixo) para evitar overfitting
-        # C=0.3 — regularizacao forte para evitar overfitting em negativos sinteticos.
-        # Quanto menor o C, mais conservador o modelo (menos falsos positivos).
-        # Se ainda tiver falsos positivos, grave negativos reais:
-        #   pasta: config/wakeword_audio/negativos/
-        #   coloque .wav de voce falando qualquer coisa menos "sirius"
+        # C=0.3: regularização forte — evita overfitting em negativos sintéticos
+        # class_weight="balanced": compensa desbalanceamento positivo/negativo
         clf = LogisticRegression(max_iter=1000, C=0.3, class_weight="balanced")
         clf.fit(X_s, y)
 
-        # Cross-validation para ver se generaliza
+        # Cross-validation para medir generalização real
         try:
-            scores = cross_val_score(clf, X_s, y, cv=3, scoring="f1")
-            print(f"[TREINO]: F1 (cross-val): {scores.mean():.1%} ± {scores.std():.1%}")
-            if scores.mean() < 0.5:
-                print("[TREINO]: ⚠ F1 baixo — modelo pode não generalizar bem.")
-                print("[TREINO]: Dica: grave amostras negativas reais (veja abaixo).")
+            from sklearn.model_selection import cross_val_score
+            scores = cross_val_score(clf, X_s, y, cv=min(3, n_pos), scoring="f1")
+            print(f"[TREINO]: F1 cross-val: {scores.mean():.1%} ± {scores.std():.1%}")
+            if scores.mean() < 0.6:
+                print("[TREINO]: ⚠ F1 baixo. Grave negativos reais para melhorar:")
+                print(f"  Pasta: {pasta_neg}")
+                print("  Fale qualquer coisa EXCETO 'sirius' em arquivos .wav")
         except Exception:
             pass
 
-        acuracia = clf.score(X_s, y)
-        print(f"[TREINO]: Acurácia no treino: {acuracia:.1%}")
-
-        # Salva
+        # Salva como pkl (o loop de detecção vai usar pkl se não achar onnx)
         modelo_pkl = self.caminho_modelo.replace(".onnx", "_fallback.pkl")
         with open(modelo_pkl, "wb") as f:
             pickle.dump({"clf": clf, "scaler": scaler}, f)
 
+        print(f"\033[92m[TREINO]: Modelo alternativo salvo: {modelo_pkl}\033[0m")
+        print(f"\033[92m[TREINO]: Acurácia: {clf.score(X_s, y):.1%}\033[0m")
+
+        # Sinaliza para o loop usar o pkl
         flag_path = self.caminho_modelo.replace(".onnx", ".pkl_mode")
         open(flag_path, "w").close()
-
-        print(f"\033[92m[TREINO]: Modelo salvo: {modelo_pkl}\033[0m")
-        print()
-        print("💡 Para melhorar ainda mais, grave negativos reais:")
-        print(f"   Crie a pasta: {pasta_neg}")
-        print("   Coloque .wav de você falando qualquer coisa MENOS 'sirius'")
-        print("   (ex: 'abre o chrome', 'tudo bem', 'que horas são')")
-        print("   Depois retreine: python src/sirius_wakeword.py --so-treinar")
         return True
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -920,11 +915,13 @@ class TreinadorWakeWord:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sirius Wake Word")
-    parser.add_argument("--treinar",     action="store_true", help="Grava amostras E treina")
-    parser.add_argument("--so-treinar",  action="store_true", help="Só treina com amostras já gravadas (não regrava)")
-    parser.add_argument("--gravar",      action="store_true", help="Só grava as amostras")
-    parser.add_argument("--testar",      action="store_true", help="Testa a detecção")
-    parser.add_argument("--repeticoes",  type=int, default=50, help="Amostras por frase")
+    parser.add_argument("--treinar",          action="store_true", help="Grava amostras E treina")
+    parser.add_argument("--so-treinar",       action="store_true", help="Só treina com amostras já gravadas")
+    parser.add_argument("--gravar",           action="store_true", help="Só grava amostras positivas")
+    parser.add_argument("--gravar-negativos", action="store_true", help="Grava amostras negativas reais (reduz falsos positivos)")
+    parser.add_argument("--testar",           action="store_true", help="Testa a detecção")
+    parser.add_argument("--diagnostico",      action="store_true", help="Diagnóstico completo do sistema")
+    parser.add_argument("--repeticoes",       type=int, default=50, help="Amostras por frase")
     args = parser.parse_args()
 
     t = TreinadorWakeWord()
@@ -946,19 +943,169 @@ if __name__ == "__main__":
         if t.gravar_amostras(args.repeticoes):
             t.treinar()
 
+    elif args.gravar_negativos:
+        # Grava amostras negativas reais — melhora muito a precisão
+        pasta_neg = os.path.join(t.caminho_audio, "negativos")
+        os.makedirs(pasta_neg, exist_ok=True)
+
+        try:
+            import pyaudio, wave
+        except ImportError:
+            print("pip install pyaudio")
+            sys.exit(1)
+
+        print(f"\n{'='*55}")
+        print("  GRAVAÇÃO DE AMOSTRAS NEGATIVAS REAIS")
+        print(f"{'='*55}")
+        print("  Fale QUALQUER COISA exceto as frases de ativação.")
+        print("  Ex: 'abre o chrome', 'que horas são', 'tudo bem'")
+        print(f"  Destino: {pasta_neg}")
+        print()
+
+        frases_neg = [
+            "abre o chrome",
+            "que horas são agora",
+            "tudo bem por aqui",
+            "como está o sistema",
+            "manda mensagem pro João",
+            "qual é a temperatura hoje",
+            "desliga o monitor",
+            "coloca uma música",
+        ]
+
+        pa = pyaudio.PyAudio()
+        RATE = 16000; CHUNK = 1024; SECS = 2.0
+        N_FRAMES = int(RATE / CHUNK * SECS)
+        n_gravados = 0
+
+        for frase in frases_neg:
+            print(f"  Diga: '{frase}'")
+            input("  [Enter para gravar]")
+            for i in range(args.repeticoes // len(frases_neg) + 1):
+                print(f"  Gravando... ({SECS:.0f}s)", end="\r")
+                try:
+                    st = pa.open(format=pyaudio.paInt16, channels=1,
+                                 rate=RATE, input=True, frames_per_buffer=CHUNK)
+                    frames = [st.read(CHUNK) for _ in range(N_FRAMES)]
+                    st.stop_stream(); st.close()
+                    fname = os.path.join(pasta_neg, f"neg_{frase[:15].replace(' ','_')}_{i:03d}.wav")
+                    with wave.open(fname, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+                        wf.setframerate(RATE)
+                        wf.writeframes(b"".join(frames))
+                    n_gravados += 1
+                except Exception as e:
+                    print(f"Erro: {e}")
+
+        pa.terminate()
+        print(f"\n  ✓ {n_gravados} negativos gravados em {pasta_neg}")
+        print("  Agora retreine: python sirius_wakeword.py --so-treinar")
+
+    elif args.diagnostico:
+        # Mostra diagnóstico completo do sistema de wake word
+        print(f"\n{'='*55}")
+        print("  DIAGNÓSTICO WAKE WORD")
+        print(f"{'='*55}")
+
+        pkl_path  = CAMINHO_MODELO_CUSTOM.replace(".onnx", "_fallback.pkl")
+        onnx_path = CAMINHO_MODELO_CUSTOM
+        audio_dir = os.path.join(diretorio_raiz, "config", "wakeword_audio")
+        neg_dir   = os.path.join(audio_dir, "negativos")
+
+        print(f"  Modelo MFCC (.pkl):   {'✓ ' + pkl_path if os.path.exists(pkl_path) else '✗ não existe'}")
+        print(f"  Modelo ONNX:          {'✓' if os.path.exists(onnx_path) else '✗ não existe'}")
+
+        n_pos = len([f for f in os.listdir(audio_dir) if f.endswith(".wav")]) if os.path.exists(audio_dir) else 0
+        n_neg = len([f for f in os.listdir(neg_dir) if f.endswith(".wav")]) if os.path.exists(neg_dir) else 0
+        print(f"  Amostras positivas:   {n_pos}")
+        print(f"  Amostras negativas:   {n_neg} {'⚠ Adicione negativos reais!' if n_neg == 0 else '✓'}")
+
+        if os.path.exists(pkl_path):
+            import pickle
+            with open(pkl_path, "rb") as f:
+                dados = pickle.load(f)
+            clf = dados.get("clf")
+            if clf and hasattr(clf, "coef_"):
+                print(f"  Threshold atual:      0.88 (prob no loop MFCC)")
+                print(f"  Regularização C:      {clf.C if hasattr(clf, 'C') else '?'}")
+
+        print()
+        if n_neg == 0:
+            print("  RECOMENDAÇÃO: Grave negativos reais para reduzir falsos positivos:")
+            print("    python sirius_wakeword.py --gravar-negativos")
+        if n_pos < 20:
+            print("  RECOMENDAÇÃO: Mais amostras positivas melhoram a precisão:")
+            print("    python sirius_wakeword.py --gravar")
+        print(f"{'='*55}\n")
+
     elif args.testar:
-        print("Testando wake word. Ctrl+C para parar.")
+        import threading
+
+        def _falar(texto: str):
+            """Fala uma instrução em voz usando pyttsx3."""
+            try:
+                import pyttsx3
+                engine = pyttsx3.init()
+                # Tenta voz em português
+                for v in engine.getProperty("voices"):
+                    if "brazil" in v.name.lower() or "portuguese" in v.name.lower():
+                        engine.setProperty("voice", v.id)
+                        break
+                engine.setProperty("rate", 170)
+                engine.say(texto)
+                engine.runAndWait()
+                engine.stop()
+            except Exception as e:
+                print(f"[VOZ]: {texto}  (pyttsx3 falhou: {e})")
+
         def _cb():
-            print("✓ Wake word detectada!")
+            print("\033[92m✓ Wake word detectada!\033[0m")
+            threading.Thread(
+                target=_falar,
+                args=("Wake word detectada. Pode falar o comando.",),
+                daemon=True
+            ).start()
+
+        # Instrução inicial em voz
+        print("\n[TESTE WAKE WORD]")
+        print("  Modo: Whisper Tiny" if not os.path.exists(
+            os.path.join(diretorio_raiz, "config", "sirius_wakeword_fallback.pkl")
+        ) else "  Modo: Modelo treinado (MFCC)")
+        print("  Diga 'Sirius' para ativar.")
+        print("  Ctrl+C para parar.\n")
+
+        threading.Thread(
+            target=_falar,
+            args=("Teste de wake word iniciado. Diga Sirius para ativar.",),
+            daemon=True
+        ).start()
 
         ww = SiriusWakeWord(callback_ativado=_cb)
         ww.iniciar()
+
+        # Lembra o usuário a cada 20 segundos se não detectar nada
+        _ultimo_lembrete = time.time()
+        _lembrete_intervalo = 20
+
         try:
             while True:
                 time.sleep(1)
+                agora = time.time()
+                if agora - _ultimo_lembrete >= _lembrete_intervalo and ww._deteccoes == 0:
+                    _ultimo_lembrete = agora
+                    threading.Thread(
+                        target=_falar,
+                        args=("Diga Sirius para testar.",),
+                        daemon=True
+                    ).start()
         except KeyboardInterrupt:
             ww.parar()
-            print(f"\nDetecções: {ww._deteccoes}")
+            n = ww._deteccoes
+            print(f"\nDetecções: {n}")
+            msg = f"Teste concluído. {n} detecções registradas." if n > 0                   else "Nenhuma detecção. Tente falar mais perto do microfone."
+            _falar(msg)
+            print(msg)
 
     else:
         parser.print_help()

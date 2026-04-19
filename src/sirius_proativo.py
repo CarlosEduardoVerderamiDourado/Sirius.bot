@@ -121,7 +121,7 @@ class Lembrete:
         return abs((agora - target).total_seconds()) <= 30
 
     def mensagem(self) -> str:
-        return f"Chefia, lembrete: {self.descricao}!"
+        return f"🔔 Lembrete, chefe: {self.descricao}."
 
     def to_dict(self):
         return {"hora": self.hora, "minuto": self.minuto,
@@ -162,46 +162,111 @@ class MonitorSistema:
         return False
 
     def verificar(self) -> list[str]:
+        """Monitora recursos do sistema e retorna alertas no tom Jarvis."""
         alertas = []
         try:
             import psutil
 
+            # --- Bateria ---
             bat = psutil.sensors_battery()
             if bat and not bat.power_plugged:
                 pct = bat.percent
                 if pct <= 10 and self._pode("bateria_critica"):
                     alertas.append(
-                        f"Chefia, bateria crítica em {pct:.0f}%! "
-                        "Conecta o carregador ou vai desligar."
+                        f"⚠ Bateria crítica — {pct:.0f}%. "
+                        "Conecte o carregador imediatamente, chefe."
                     )
                 elif pct <= 20 and self._pode("bateria_baixa"):
                     mins = int(bat.secsleft / 60) if bat.secsleft and bat.secsleft > 0 else 0
-                    sufixo = f" Restam uns {mins} minutos." if mins > 5 else ""
-                    alertas.append(f"Bateria em {pct:.0f}%, chefia.{sufixo} Bora plugar.")
+                    tempo = f" Autonomia restante: ~{mins} minutos." if mins > 5 else ""
+                    alertas.append(
+                        f"⚠ Bateria em {pct:.0f}%.{tempo} Recomendo conectar o carregador."
+                    )
 
+            # --- RAM ---
             mem = psutil.virtual_memory()
             if mem.percent >= 90 and self._pode("ram_alta"):
+                livre_gb = mem.available / (1024 ** 3)
                 alertas.append(
-                    f"Memória em {mem.percent:.0f}%, chefia. "
-                    "Pode começar a travar. Fecha algum programa pesado."
+                    f"⚠ Memória em {mem.percent:.0f}% — apenas {livre_gb:.1f} GB disponíveis. "
+                    "Considere fechar aplicações pesadas."
                 )
 
+            # --- CPU ---
             cpu = psutil.cpu_percent(interval=0.5)
             if cpu >= 95 and self._pode("cpu_alta"):
-                alertas.append(f"CPU em {cpu:.0f}% há um tempinho. Tem algo pesado rodando.")
-
-            disco = psutil.disk_usage("/")
-            if disco.percent >= 95 and self._pode("disco_cheio"):
-                livre = disco.free / (1024 ** 3)
                 alertas.append(
-                    f"Disco quase cheio, chefia! Só {livre:.1f} GB livres. "
-                    "Hora de limpar umas coisas."
+                    f"⚠ CPU em {cpu:.0f}%. Algum processo está consumindo excessivamente."
                 )
+
+            # --- Disco ---
+            disco = psutil.disk_usage("/")
+            if disco.percent >= 90 and self._pode("disco_cheio"):
+                livre_gb = disco.free / (1024 ** 3)
+                alertas.append(
+                    f"⚠ Disco em {disco.percent:.0f}% — {livre_gb:.1f} GB livres. "
+                    "Limpeza recomendada."
+                )
+
+            # --- Novo: aviso de CPU alta sustentada (70%+ por muito tempo) ---
+            if cpu >= 70 and self._pode("cpu_moderada") if "cpu_moderada" in self._COOLDOWN else False:
+                alertas.append(f"ℹ CPU em {cpu:.0f}%. Sistema sob carga moderada.")
+
         except ImportError:
             pass
         except Exception as e:
             print(f"[PROATIVO]: Erro no monitor de sistema: {e}")
         return alertas
+
+
+# ---------------------------------------------------------------------------
+# Monitor de processos — detecta apps que estão pesando
+# ---------------------------------------------------------------------------
+
+class MonitorProcessos:
+    """
+    Detecta processos pesados rodando em background e alerta o usuário.
+    Útil quando o PC fica lento sem motivo aparente.
+    """
+    def __init__(self):
+        self._ultimo_alerta: float = 0
+        self._COOLDOWN = 1800  # 30 minutos entre alertas
+
+    def verificar(self) -> list[str]:
+        agora = time.time()
+        if agora - self._ultimo_alerta < self._COOLDOWN:
+            return []
+        try:
+            import psutil
+            # Só verifica se CPU estiver alta
+            cpu_total = psutil.cpu_percent(interval=0.3)
+            if cpu_total < 80:
+                return []
+
+            # Pega top 3 processos por CPU
+            procs = []
+            for p in psutil.process_iter(['name', 'cpu_percent', 'memory_percent']):
+                try:
+                    if p.info['cpu_percent'] and p.info['cpu_percent'] > 10:
+                        procs.append(p.info)
+                except Exception:
+                    pass
+
+            if not procs:
+                return []
+
+            procs.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
+            top = procs[:3]
+            nomes = ', '.join(
+                f"{p['name']} ({p['cpu_percent']:.0f}%)" for p in top
+            )
+            self._ultimo_alerta = agora
+            return [f"ℹ Processos pesados detectados: {nomes}."]
+
+        except ImportError:
+            return []
+        except Exception:
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +290,14 @@ class MonitorClima:
             if msg:
                 alertas.append(msg)
 
-        # Alerta de chuva (máx 1x a cada 3h)
-        if time.time() - self._ultimo_alerta_chuva > 10800:
-            msg = self._checar_chuva()
-            if msg:
-                self._ultimo_alerta_chuva = time.time()
-                alertas.append(msg)
+        # Alerta de chuva — só de manhã (7h–11h), máx 1x por dia
+        # Fora desse horário não faz sentido avisar sobre chuva sem ser pedido
+        if 7 <= agora.hour <= 11:
+            if time.time() - self._ultimo_alerta_chuva > 86400:  # 1x por dia
+                msg = self._checar_chuva()
+                if msg:
+                    self._ultimo_alerta_chuva = time.time()
+                    alertas.append(msg)
 
         return alertas
 
@@ -284,6 +351,52 @@ class MonitorHora:
 
 
 # ---------------------------------------------------------------------------
+# Monitor de concentração — avisa após uso contínuo longo sem pausa
+# ---------------------------------------------------------------------------
+
+class MonitorConcentracao:
+    """
+    Jarvis cuida do chefe.
+    Após 90 minutos de uso contínuo, avisa para fazer uma pausa.
+    Reseta ao detectar inatividade (scheduler em standby).
+    """
+    TEMPO_AVISO_MIN  = 90   # minutos de uso contínuo antes de avisar
+    COOLDOWN_AVISO   = 3600 # 1h entre avisos
+
+    def __init__(self):
+        self._inicio_sessao  : float = time.time()
+        self._ultimo_aviso   : float = 0
+        self._em_standby     : bool  = False
+
+    def registrar_atividade(self):
+        """Chamado pelo cerebro a cada interação."""
+        if self._em_standby:
+            self._em_standby    = False
+            self._inicio_sessao = time.time()  # reseta contador
+
+    def registrar_standby(self):
+        """Chamado pelo scheduler quando entra em standby."""
+        self._em_standby = True
+
+    def verificar(self) -> list[str]:
+        agora = time.time()
+        if self._em_standby:
+            return []
+        tempo_uso = (agora - self._inicio_sessao) / 60  # em minutos
+        if tempo_uso >= self.TEMPO_AVISO_MIN:
+            if agora - self._ultimo_aviso >= self.COOLDOWN_AVISO:
+                self._ultimo_aviso = agora
+                h = int(tempo_uso // 60)
+                m = int(tempo_uso % 60)
+                duracao = f"{h}h{m:02d}min" if h > 0 else f"{m} minutos"
+                return [
+                    f"ℹ Chefe, {duracao} de uso contínuo. "
+                    "Considere fazer uma pausa."
+                ]
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Briefing Matinal — fala sem ser perguntado todo dia de manhã
 # ---------------------------------------------------------------------------
 
@@ -308,14 +421,14 @@ class BriefingMatinal:
     """
 
     _FRASES_MOTIVACIONAIS = [
-        "Hoje é mais um dia pra mandar bem, chefia.",
-        "Foco total. Vamos que vamos.",
-        "Tô aqui do seu lado. Pode mandar.",
-        "Missão do dia: arrasar. Pode deixar que eu cuido do resto.",
-        "Mais um dia, mais uma chance de evoluir.",
-        "Sistemas operacionais. Pronto pra missão.",
-        "Hoje vai ser bom. Eu sinto nos meus circuitos.",
-        "Carpe diem, chefia. Bora fazer acontecer.",
+        "Sistemas operacionais. Pronto para a missão, chefe.",
+        "Todos os sistemas nominais. É hora de trabalhar.",
+        "Aguardando instruções, chefe.",
+        "Pronto quando o senhor estiver.",
+        "O dia é seu, chefe. Estou à disposição.",
+        "Operacional e à postos.",
+        "Missão do dia recebida. Pode contar comigo.",
+        "Monitorando todos os sistemas. Tudo nominal por enquanto.",
     ]
 
     def __init__(self, lembretes_ref: list):
@@ -349,9 +462,18 @@ class BriefingMatinal:
         """
         Gera o briefing como lista de partes para falar em sequência.
         Cada parte é uma frase curta — permite pausas naturais entre elas.
+        Usa o perfil do usuário se disponível.
         """
         partes = []
         agora  = datetime.now()
+
+        # Busca nome do perfil se disponível
+        nome_usuario = "chefia"
+        try:
+            from sirius_perfil import get_perfil
+            nome_usuario = get_perfil().nome_usuario()
+        except Exception:
+            pass
 
         # ── 1. Saudação + data ────────────────────────────────────────────
         dia_sem = DIAS_SEMANA[agora.weekday()]
@@ -359,8 +481,8 @@ class BriefingMatinal:
         mes     = MESES[agora.month]
         hora    = agora.strftime("%H:%M")
         partes.append(
-            f"Bom dia, chefia! São {hora} de {dia_sem}, "
-            f"{dia_num} de {mes}."
+            f"Bom dia, {nome_usuario}. São {hora} de {dia_sem}, "
+            f"{dia_num} de {mes}. Sistemas operacionais."
         )
 
         # ── 2. Clima ──────────────────────────────────────────────────────
@@ -405,7 +527,7 @@ class BriefingMatinal:
                     f"Você tem {len(lembretes_hoje)} lembretes hoje: {lista}."
                 )
         else:
-            partes.append("Sem lembretes agendados pra hoje.")
+            partes.append("Nenhum lembrete agendado para hoje.")
 
         # ── 5. Status da bateria (só se notebook e não carregando) ────────
         try:
@@ -455,6 +577,17 @@ class SiriusProativo:
 
         self._carregar()
 
+    def registrar_atividade_usuario(self):
+        """
+        Chamado pelo cerebro.py a cada interação do usuário.
+        Alimenta o MonitorConcentracao para rastrear tempo de uso.
+        """
+        self._monitor_foco.registrar_atividade()
+
+    def registrar_standby(self):
+        """Chamado pelo scheduler quando entra em standby."""
+        self._monitor_foco.registrar_standby()
+
     def registrar_callback(self, callback_falar, callback_log=None):
         self._falar = callback_falar
         if callback_log:
@@ -502,8 +635,12 @@ class SiriusProativo:
             alertas += self._verificar_lembretes()
             alertas += self._monitor_sistema.verificar()
             alertas += self._monitor_hora.verificar()
+            alertas += self._monitor_foco.verificar()
 
-            if _ciclo % 10 == 0:   # clima a cada ~5min
+            if _ciclo % 4 == 0:   # processos pesados a cada ~2min
+                alertas += self._monitor_processos.verificar()
+
+            if _ciclo % 10 == 0:  # clima a cada ~5min
                 alertas += self._monitor_clima.verificar()
 
             # Briefing matinal — verifica a cada ciclo, dispara 1x por dia
@@ -579,6 +716,11 @@ class SiriusProativo:
         "agenda lembrete", "cria lembrete", "bota lembrete",
         "coloca lembrete", "adiciona lembrete", "novo lembrete",
         "lembrete para", "lembrete às", "lembrete as",
+        # Alarme — sinônimo de lembrete para o Sirius
+        "programa um alarme", "programa alarme", "cria um alarme",
+        "bota um alarme", "coloca um alarme", "agenda um alarme",
+        "alarme para", "alarme às", "alarme as", "alarme em",
+        "set alarm", "alarme daqui",
     }
     _TRIGGERS_LISTAR   = {
         "meus lembretes", "quais lembretes", "lista lembretes",
@@ -634,7 +776,7 @@ class SiriusProativo:
         Fala em background e retorna confirmação.
         """
         threading.Thread(target=self._disparar_briefing, daemon=True).start()
-        return "Preparando seu briefing, chefia!"
+        return "Preparando briefing. Um momento, chefe."
 
     def configurar_briefing(self, hora_inicio: int = 7, hora_fim: int = 9):
         """Configura o horário do briefing matinal."""
@@ -656,15 +798,18 @@ class SiriusProativo:
         with self._lock:
             self._lembretes.append(Lembrete(hora, minuto, descricao, repetir))
             self._salvar()
-        rep = " (todo dia)" if repetir else ""
-        return f"Anotado! Às {hora:02d}:{minuto:02d}{rep}: {descricao}."
+        rep = " (recorrente)" if repetir else ""
+        return f"Registrado. {hora:02d}:{minuto:02d}{rep} — {descricao}."
 
     def _listar_lembretes(self) -> str:
         with self._lock:
             ativos = [l for l in self._lembretes if not (l.disparado and not l.repetir)]
         if not ativos:
-            return "Sem lembretes agendados, chefia."
-        return "Lembretes:\n" + "\n".join(f"{i+1}. {l}" for i, l in enumerate(ativos))
+            return "Nenhum lembrete agendado, chefe."
+        linhas = ["Lembretes agendados:"]
+        for i, l in enumerate(ativos, 1):
+            linhas.append(f"  {i}. {l}")
+        return "\n".join(linhas)
 
     def _cancelar_lembretes(self, texto: str) -> str:
         with self._lock:

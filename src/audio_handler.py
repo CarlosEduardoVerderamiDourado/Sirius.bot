@@ -228,9 +228,13 @@ class SiriusAudio:
             from sirius_tts import get_tts
             tts = get_tts()
             if tts.kokoro_disponivel:
-                return tts.falar(texto)
+                resultado = tts.falar(texto)
+                if not resultado:
+                    print("\033[33m[TTS]: Kokoro retornou False — caindo em pyttsx3.\033[0m")
+                return resultado
             return False
-        except Exception:
+        except Exception as e:
+            print(f"\033[33m[TTS]: Kokoro exceção: {e}\033[0m")
             return False
 
     def _falar_elevenlabs(self, texto: str) -> bool:

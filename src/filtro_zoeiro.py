@@ -1,245 +1,217 @@
 """
-filtro_zoeiro.py — Personalidade consistente do Sirius
+filtro_zoeiro.py — Personalidade do Sirius
 
-Filosofia:
-  - SECO e DIRETO: sem enrolação, vai direto ao ponto
-  - PARÇA brasileiro: gírias naturais, não forçadas
-  - CONSISTENTE: não muda de estilo a cada mensagem
-  - STATUS sempre formatado: "Online. CPU 12%. Tudo nominal."
-  - CONFIRMAÇÃO antes de ações destrutivas ou irreversíveis
-  - FEEDBACK após executar: sempre confirma o que fez
+Referência: J.A.R.V.I.S. do Iron Man.
+  - Seco e preciso. Vai direto ao ponto, sem enrolação.
+  - Tom profissional com leve ironia quando conveniente.
+  - Nunca bajulador, nunca grita, nunca usa "kkk".
+  - Confirma o que foi feito. Alerta quando tem problema.
+  - Trata o usuário como "chefe" (não "mano", não "parceiro").
+  - Não começa toda resposta com a mesma frase.
 
-O que NÃO faz mais:
-  - Não abre TODA resposta com "Eae mano olha o que eu desenrolei aqui:"
-  - Não fecha com "kkkk" em respostas técnicas
-  - Não aplica estilo aleatório — contexto define o tom
+Jarvis NÃO diz:
+  "Eae mano olha o que eu desenrolei aqui:"
+  "Papo reto, a fita é a seguinte:"
+  "Vê se faz sentido aí, kkkk."
+
+Jarvis DIZ:
+  "Prontamente, chefe."
+  "Identificado. Aqui está:"
+  "Feito."
+  "Como solicitado."
+  "Registrado."
 """
 
 import re
 import random
 
 
-# ---------------------------------------------------------------------------
-# Detectores de contexto
-# ---------------------------------------------------------------------------
-
-def _eh_status(texto: str) -> bool:
-    """Detecta resposta de status do sistema."""
+def _eh_status(texto):
     t = texto.lower()
     return any(p in t for p in [
         "cpu", "ram", "memória", "disco", "bateria", "online",
-        "processador", "temperatura", "ping", "%", "mb", "gb",
+        "processador", "%", "mb", "gb", "nominal", "operacional",
     ])
 
-def _eh_confirmacao(texto: str) -> bool:
-    """Detecta resposta que precisa de confirmação."""
-    t = texto.lower()
-    return any(p in t for p in [
-        "desligando", "reiniciando", "deletando", "formatando",
-        "removendo", "excluindo", "encerrando todos",
-    ])
-
-def _eh_feedback_acao(texto: str) -> bool:
-    """Detecta feedback de ação executada."""
-    t = texto.lower()
-    return any(p in t for p in [
-        "aberto", "fechado", "enviado", "criado", "salvo",
-        "executado", "iniciado", "parado", "movido", "copiado",
-        "instalado", "desinstalado", "atualizado",
-    ]) and len(texto) < 120
-
-def _eh_resposta_tecnica(texto: str) -> bool:
-    """Detecta resposta técnica: código, erros, URLs, dados."""
+def _eh_feedback_acao(texto):
     return (
-        "```" in texto or
-        "http" in texto or
-        re.search(r"\b(TypeError|ValueError|Error|Exception)\b", texto) is not None or
-        re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}", texto) is not None
+        texto.startswith("✓") or texto.startswith("✗") or texto.startswith("⚠") or
+        (len(texto) < 80 and any(p in texto.lower() for p in [
+            "aberto", "fechado", "enviado", "criado", "salvo",
+            "executado", "iniciado", "parado", "cancelado",
+        ]))
     )
 
-def _eh_resposta_longa(texto: str) -> bool:
-    return len(texto) > 300
+def _eh_resposta_tecnica(texto):
+    return (
+        "```" in texto or
+        re.search(r"https?://", texto) is not None or
+        re.search(r"\b(TypeError|ValueError|Error|Exception|Traceback)\b", texto) is not None
+    )
 
-def _contem_lista(texto: str) -> bool:
+def _eh_pergunta_sem_resposta(texto):
+    t = texto.lower()
+    return any(p in t for p in [
+        "ainda não sei", "não sei responder", "já anotei",
+        "não encontrei", "não tenho informação",
+    ])
+
+def _eh_saudacao(texto):
+    t = texto.lower().strip()
+    return any(t.startswith(p) for p in [
+        "bom dia", "boa tarde", "boa noite", "oi!", "olá",
+        "e aí", "tudo certo", "tudo bom",
+    ])
+
+def _eh_longa(texto):
+    return len(texto) > 280
+
+def _tem_lista(texto):
     return bool(re.search(r"^\s*[-•\d]", texto, re.MULTILINE))
 
 
-# ---------------------------------------------------------------------------
-# Formatadores de estilo
-# ---------------------------------------------------------------------------
-
-# Aberturas naturais — usadas COM MODERAÇÃO (20% das vezes)
-_ABERTURAS = [
-    "Ó:",
-    "Olha:",
-    "Então:",
-    "Seguinte:",
-    "Anotado —",
+_REMOVER = [
+    "Claro!", "Claro, ", "Com certeza!", "Com certeza, ",
+    "Olá!", "Olá, ", "Oi!", "Oi, ",
+    "É um prazer", "Fico feliz em ajudar", "Certamente!",
+    "Certamente, ", "Com prazer!", "Com prazer, ",
+    "Entendido!", "Ótima pergunta!", "Excelente pergunta!",
+    "Eae mano", "Eae", "Parça", "parceiro",
+    "Papo reto, a fita é a seguinte:",
+    "Ó o que apareceu nos meus circuitos",
+    "Vê se faz sentido aí, kkkk.",
+    "Tamo junto, qualquer fita me avisa.",
+    "Se não for isso, a gente caça de novo, vamo que vamo.",
+    "É isso, mano. Dá um check aí!",
+    "Seguinte, se liga nessa fita:",
 ]
 
-# Fechamentos naturais — usados COM MODERAÇÃO (25% das vezes)
-_FECHAMENTOS = [
-    "Qualquer coisa, grita.",
-    "Tamo junto.",
-    "Dá um check aí.",
-    "Fechou?",
-    "Se precisar de mais, é só falar.",
-]
-
-# Confirmações de ação — sempre no mesmo formato
-_CONFIRMACOES_ACAO = {
-    "aberto":       "✓ {objeto} aberto.",
-    "fechado":      "✓ {objeto} fechado.",
-    "enviado":      "✓ Mensagem enviada para {objeto}.",
-    "criado":       "✓ {objeto} criado.",
-    "salvo":        "✓ Salvo.",
-    "executado":    "✓ Executado.",
-    "parado":       "✓ Parado.",
-}
-
-
-# ---------------------------------------------------------------------------
-# Limpeza de formalidades que chegam do AgentePesquisador
-# ---------------------------------------------------------------------------
-
-_FORMALIDADES = [
-    "Claro!", "Com certeza!", "Olá!", "Olá, ", "Oi!", "Oi, ",
-    "É um prazer", "Fico feliz em ajudar", "Certamente",
-    "Com prazer", "Entendido!", "Entendido,",
-]
-
-def _limpar_formalidades(texto: str) -> str:
-    for f in _FORMALIDADES:
-        texto = texto.replace(f, "").strip()
-    texto = re.sub(r"^[,\s]+", "", texto)
+def _limpar(texto):
+    for frase in _REMOVER:
+        texto = texto.replace(frase, "").strip()
+    texto = re.sub(r"^[,\.!\s]+", "", texto)
+    texto = re.sub(r"\bk{2,}\b\.?", "", texto, flags=re.IGNORECASE)
     return texto.strip()
 
 
-# ---------------------------------------------------------------------------
-# SiriusFiltro principal
-# ---------------------------------------------------------------------------
+_PREFIXOS_INFO = [
+    "Aqui está:",
+    "Como solicitado:",
+    "Identificado —",
+    "Encontrei o seguinte:",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+]
+
+_SEM_RESPOSTA = [
+    "Não tenho dados suficientes sobre isso no momento, chefe. Já estou pesquisando.",
+    "Ainda não tenho uma resposta precisa. Registrei para pesquisar.",
+    "Informação insuficiente no momento. Já anotei.",
+]
+
+_FECHAMENTOS_RAROS = [
+    "Precisa de mais alguma coisa, chefe?",
+    "Há mais algo?",
+    "Posso ajudar com mais alguma coisa?",
+]
+
 
 class SiriusFiltro:
 
     def aplicar_zoeira(self, texto: str) -> str:
-        """
-        Aplica personalidade Jarvis ao texto.
-        Consistente, seco, direto — não aleatório.
-        """
+        if not texto or len(texto) < 3:
+            return texto
+
+        texto = _limpar(texto)
         if not texto:
             return texto
 
-        # Limpeza sempre
-        texto = _limpar_formalidades(texto)
-
-        if not texto:
-            return texto
-
-        # Respostas técnicas saem limpas — sem estilo
-        if _eh_resposta_tecnica(texto):
-            return texto
-
-        # Status do sistema — formato fixo, sem enfeites
-        if _eh_status(texto):
-            return texto
-
-        # Feedback de ação curto — já é direto, não mexe
+        # Casos que saem sem modificação
         if _eh_feedback_acao(texto):
             return texto
-
-        # Respostas longas ou com lista — não polui com "eae mano"
-        if _eh_resposta_longa(texto) or _contem_lista(texto):
-            # Só remove formalidade e fecha discretamente 10% das vezes
-            if random.random() < 0.10:
-                return f"{texto}\n\n{random.choice(_FECHAMENTOS)}"
+        if _eh_status(texto) and texto.startswith("Online"):
+            return texto
+        if _eh_resposta_tecnica(texto):
+            return texto
+        if _eh_saudacao(texto):
             return texto
 
-        # Respostas médias — aplica estilo com moderação
+        # "Não sei" — substitui por versão Jarvis
+        if _eh_pergunta_sem_resposta(texto):
+            return random.choice(_SEM_RESPOSTA)
+
+        # Respostas longas/lista — fechamento raramente
+        if _eh_longa(texto) or _tem_lista(texto):
+            if random.random() < 0.12:
+                return f"{texto}\n\n{random.choice(_FECHAMENTOS_RAROS)}"
+            return texto
+
+        # Respostas médias
+        # 70% sai limpo, 20% com prefixo, 10% com fechamento
         sorteio = random.random()
 
-        if sorteio < 0.15:
-            # Abertura discreta (15%)
-            return f"{random.choice(_ABERTURAS)} {texto}"
+        if sorteio < 0.20:
+            prefixo = random.choice(_PREFIXOS_INFO)
+            if prefixo and not texto.lower().startswith(prefixo.lower().rstrip(":")):
+                sep = " " if prefixo.endswith((":","—")) else " "
+                return f"{prefixo}{sep}{texto}"
 
-        elif sorteio < 0.35:
-            # Fechamento (20%)
-            return f"{texto}\n{random.choice(_FECHAMENTOS)}"
+        elif sorteio < 0.30:
+            return f"{texto}\n\n{random.choice(_FECHAMENTOS_RAROS)}"
 
-        # 65% sai limpo — confia no conteúdo
         return texto
 
-    # -----------------------------------------------------------------------
-    # Formatadores especiais — chamados pelo cerebro.py diretamente
-    # -----------------------------------------------------------------------
-
     @staticmethod
-    def formatar_status(cpu: float, ram: float, ram_usada_mb: int = 0,
-                        ram_total_mb: int = 0, bateria: float = None,
-                        disco: float = None) -> str:
-        """
-        Formato fixo de status — igual ao Jarvis.
-        "Online. CPU 12% | RAM 45% (7GB/16GB). Tudo nominal."
-        """
+    def formatar_status(cpu: float, ram: float,
+                        ram_usada_mb: int = 0, ram_total_mb: int = 0,
+                        bateria: float = None, disco: float = None) -> str:
         partes = [f"CPU {cpu:.0f}%"]
-
         if ram_total_mb > 0:
-            ram_gb_usado = ram_usada_mb / 1024
-            ram_gb_total = ram_total_mb / 1024
-            partes.append(f"RAM {ram:.0f}% ({ram_gb_usado:.1f}GB/{ram_gb_total:.1f}GB)")
+            u = ram_usada_mb / 1024
+            t = ram_total_mb / 1024
+            partes.append(f"RAM {ram:.0f}% ({u:.1f}GB/{t:.1f}GB)")
         else:
             partes.append(f"RAM {ram:.0f}%")
-
         if disco is not None:
             partes.append(f"Disco {disco:.0f}%")
-
         if bateria is not None:
             partes.append(f"Bateria {bateria:.0f}%")
 
-        linha_recursos = " | ".join(partes)
+        recursos = " | ".join(partes)
+        alertas = []
+        if cpu > 90:                            alertas.append("CPU crítica")
+        if ram > 90:                            alertas.append("RAM crítica")
+        if disco and disco > 90:                alertas.append("disco quase cheio")
+        if bateria is not None and bateria < 15: alertas.append("bateria crítica")
 
-        # Avalia saúde geral
-        problemas = []
-        if cpu > 90:     problemas.append("CPU crítica")
-        if ram > 90:     problemas.append("RAM crítica")
-        if disco and disco > 90: problemas.append("disco cheio")
-        if bateria and bateria < 15: problemas.append("bateria crítica")
-
-        if problemas:
-            saude = f"⚠ {', '.join(problemas).capitalize()}."
-        else:
-            saude = "Tudo nominal."
-
-        return f"Online. {linha_recursos}. {saude}"
+        saude = f"⚠ {', '.join(alertas).capitalize()}." if alertas else "Tudo nominal."
+        return f"Online. {recursos}. {saude}"
 
     @staticmethod
     def formatar_confirmacao(acao: str, objeto: str = "",
                               reversivel: bool = True) -> str:
-        """
-        Pede confirmação antes de ação destrutiva/irreversível.
-        "Vou desligar o PC em 60 segundos. Confirma? (diga 'sim' ou 'cancela')"
-        """
+        obj = f" {objeto.strip()}" if objeto else ""
         if not reversivel:
-            return (
-                f"⚠ {acao.capitalize()}. Isso não pode ser desfeito. "
-                f"Confirma? (diga 'sim' ou 'cancela')"
-            )
-        obj_str = f" {objeto}" if objeto else ""
-        return f"Vou {acao}{obj_str}. Confirma? (diga 'sim' ou 'cancela')"
+            return f"⚠ {acao.capitalize()}{obj}. Isso não pode ser desfeito. Confirma? (sim / cancela)"
+        return f"{acao.capitalize()}{obj}. Confirma? (sim / cancela)"
 
     @staticmethod
     def formatar_feedback(acao: str, objeto: str = "") -> str:
-        """
-        Confirma ação executada — sempre curto e no mesmo formato.
-        "✓ Chrome aberto." / "✓ Mensagem enviada para João."
-        """
-        obj_str = f" {objeto.strip()}" if objeto else ""
-        return f"✓ {acao.capitalize()}{obj_str}."
+        obj = f" {objeto.strip()}" if objeto else ""
+        a = acao[0].upper() + acao[1:] if acao else acao
+        return f"✓ {a}{obj}."
 
     @staticmethod
     def formatar_erro(acao: str, motivo: str = "") -> str:
-        """
-        Informa falha de forma direta.
-        "✗ Não consegui abrir o Chrome. Arquivo não encontrado."
-        """
-        motivo_str = f" {motivo.strip()}" if motivo else ""
-        return f"✗ Não consegui {acao.lower()}.{motivo_str}"
+        a = acao[0].lower() + acao[1:] if acao else acao
+        m = f" {motivo.strip()}" if motivo else ""
+        return f"✗ Não consegui {a}.{m}"
+
+    @staticmethod
+    def formatar_alerta(mensagem: str, nivel: str = "aviso") -> str:
+        icone = {"info": "ℹ", "aviso": "⚠", "critico": "🔴"}.get(nivel, "⚠")
+        return f"{icone} {mensagem}"

@@ -944,67 +944,35 @@ def _classificar_intencao(texto, neuronio):
 # Geracao de resposta de conhecimento
 # ---------------------------------------------------------------------------
 
-def _responder_conhecimento(texto, memoria, rag=None):
+def _responder_conhecimento(texto, memoria):
     """
     Cascata de respostas — da mais confiável para a menos:
-
-    1. RAG local (FAISS) — busca vetorial no banco acumulado
-       Funciona offline, melhora com o tempo, nao alucina.
-       Ativado quando score >= 0.45 para respostas de qualidade.
-
-    2. AgentePesquisador (Wikipedia + DDG) — resposta real da internet
-       Usado quando o RAG nao tem confianca suficiente ou banco pequeno.
-
-    3. Embeddings Word2Vec + historico — busca semantica no historico
-       Fallback quando agentes falham.
-
-    4. SiriusGerador (GRU seq2seq) — ultimo recurso
-       Usado apenas com 300+ conversas para evitar geracao de lixo.
+    1. AgentePesquisador (Wikipedia + DDG) — sempre disponível, resposta real
+    2. Embeddings + histórico — busca semântica no que já foi respondido
+    3. SiriusGerador — só usado se tiver dados suficientes E resposta longa o bastante
     """
-
-    # 1. RAG local — prioridade maxima quando disponivel e confiante
-    # Retorna apenas se score alto o suficiente (evita respostas irrelevantes)
-    if rag is not None:
-        try:
-            resp_rag = rag.responder(texto, qualidade_min=0.4)
-            if resp_rag and len(resp_rag) > 40:
-                print("[CEREBRO]: RAG respondeu com confianca.")
-                return resp_rag
-        except Exception as e:
-            print("[CEREBRO]: RAG falhou: {}".format(e))
-
-    # 2. AgentePesquisador — Wikipedia PT > Wikipedia EN > DuckDuckGo
-    # Usado quando RAG nao tem material suficiente sobre o tema
+    # 1. AgentePesquisador — fonte mais confiável para perguntas de conhecimento
+    # Evita usar o gerador que ainda é fraco
     try:
         from sirius_agentes import AgentePesquisador
         pesquisador = AgentePesquisador(memoria)
         resultado   = pesquisador.executar(texto)
         if resultado and len(resultado) > 40 and "nao encontrei" not in resultado.lower():
-            # Salva no banco para que o RAG aprenda para a proxima vez
-            if memoria:
-                try:
-                    memoria.salvar_estudo_autonomo(
-                        tema=texto[:80],
-                        conteudo=resultado,
-                        tags="agente_pesquisador"
-                    )
-                except Exception:
-                    pass
             return resultado
     except Exception as e:
         print("[CEREBRO]: AgentePesquisador falhou: {}".format(e))
 
-    # 3. Busca semantica no historico (embeddings Word2Vec)
+    # 2. Busca semântica no histórico
     try:
         embeddings = _get_embeddings()
         if embeddings.esta_treinado():
-            historico = memoria.obter_historico_db(limit=50)
-            respostas = [
+            historico  = memoria.obter_historico_db(limit=50)
+            respostas  = [
                 cont for role, cont in historico
                 if role == "assistant" and len(cont) > 20
+                # Filtra respostas que são do gerador fraco (contêm frases repetidas)
                 and cont.count("mano") < 3
-                and "motor local ta fora" not in cont
-                and "ainda nao sei responder" not in cont
+                and "motor local tá fora" not in cont
             ]
             if respostas:
                 similar = embeddings.buscar_mais_similar(texto, respostas)
@@ -1013,25 +981,27 @@ def _responder_conhecimento(texto, memoria, rag=None):
     except Exception as e:
         print("[CEREBRO]: Busca semantica falhou: {}".format(e))
 
-    # 4. SiriusGerador — ultimo recurso, so com dados suficientes
+    # 3. SiriusGerador — só usa se tiver dados suficientes
+    # Com poucos dados o gerador memoriza e repete, gerando lixo
     try:
-        import sqlite3, os as _os
-        db = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                           "data", "sirius_pessoal.db")
+        import sqlite3, os
+        db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "data", "sirius_pessoal.db")
         conn = sqlite3.connect(db)
         n_conversas = conn.execute("SELECT COUNT(*) FROM conversas").fetchone()[0]
         conn.close()
 
-        if n_conversas >= 300:
+        if n_conversas >= 300:  # só usa o gerador com dados suficientes
             gerador = _get_gerador()
             if gerador.esta_treinado():
                 resposta = gerador.gerar(texto)
+                # Valida qualidade — descarta resposta com repetição
                 if resposta and len(resposta) > 20:
                     palavras = resposta.split()
                     from collections import Counter
                     freq = Counter(palavras)
                     mais_freq = freq.most_common(1)[0][1] if palavras else 0
-                    if mais_freq / max(len(palavras), 1) < 0.3:
+                    if mais_freq / max(len(palavras), 1) < 0.3:  # menos de 30% repetição
                         return resposta
     except Exception as e:
         print("[CEREBRO]: Gerador falhou: {}".format(e))
@@ -1068,7 +1038,13 @@ class SiriusCerebro:
         self._arquivos   = None
         self._proativo   = None
         self._tempo_real = None
-        self._rag        = None   # RAG local — busca vetorial FAISS
+        self._contas     = None   # Sistema de múltiplas contas
+        self._perfil     = None   # Perfil da conta ativa
+
+        # Flag de bloqueio durante gravação de amostras de voz.
+        # Enquanto True, processar() descarta tudo sem responder —
+        # evita que as frases guia ("Ei Sirius...") virem comandos.
+        self._gravando_voz = False
 
         # --- Contexto de sessão em RAM (últimas N trocas) ---
         self._contexto_sessao: list[dict] = []
@@ -1079,6 +1055,37 @@ class SiriusCerebro:
 
     def _inicializar_modulos(self):
         """Inicializa agentes, scheduler e leitor de arquivos."""
+        # Sistema de contas — carregado primeiro, fornece perfil e memória por conta
+        try:
+            from sirius_contas import SiriusContas
+            self._contas = SiriusContas()
+            if self._contas.memoria_ativa:
+                self.memoria = self._contas.memoria_ativa
+            self._perfil = self._contas.perfil_ativo
+            conta_nome = self._contas.conta_ativa.nome if self._contas.conta_ativa else "?"
+            print(f"\033[92m[CEREBRO]: Contas ativas — conta atual: '{conta_nome}'.\033[0m")
+
+            # Identificação de voz — opcional, depende de resemblyzer
+            try:
+                from sirius_voz_id import SiriusVozID
+                self._voz_id = SiriusVozID(self._contas)
+                print("\033[92m[CEREBRO]: Identificação de voz ativa.\033[0m")
+            except Exception as e_voz:
+                self._voz_id = None
+                print(f"[CEREBRO]: Voz ID indisponível: {e_voz}")
+
+        except Exception as e:
+            self._contas = None
+            self._voz_id = None
+            # Fallback: perfil único sem contas
+            try:
+                from sirius_perfil import SiriusPerfil
+                self._perfil = SiriusPerfil()
+                print(f"\033[92m[CEREBRO]: Perfil carregado ({self._perfil.nome_usuario()}).\033[0m")
+            except Exception as e2:
+                self._perfil = None
+            print(f"[CEREBRO]: Contas indisponível: {e}")
+
         # Agentes
         try:
             from sirius_agentes import SiriusAgentes
@@ -1120,6 +1127,9 @@ class SiriusCerebro:
         try:
             from sirius_proativo import SiriusProativo
             self._proativo = SiriusProativo()
+            # Injeta perfil no briefing matinal para personalizar saudação
+            if self._perfil and hasattr(self._proativo, '_briefing'):
+                self._proativo._perfil = self._perfil
             self._proativo.iniciar()
             print("\033[92m[CEREBRO]: Sistema proativo ativado.\033[0m")
         except Exception as e:
@@ -1137,16 +1147,6 @@ class SiriusCerebro:
             self._moe = None
             print(f"[CEREBRO]: MoE indisponível: {e}")
 
-        # RAG — busca vetorial FAISS (substitui o gerador fraco)
-        # Inicializa em background para nao travar a startup
-        try:
-            from sirius_rag import SiriusRAG
-            self._rag = SiriusRAG(memoria=self.memoria)
-            print("\033[92m[CEREBRO]: RAG local iniciado.\033[0m")
-        except Exception as e:
-            self._rag = None
-            print(f"[CEREBRO]: RAG indisponível (pip install faiss-cpu): {e}")
-
     def _registrar_scheduler(self, coordenador, treinador):
         """Chamado pelo main após inicializar coordenador e treinador."""
         if self._scheduler:
@@ -1163,71 +1163,28 @@ class SiriusCerebro:
                 return resposta
         return None
 
-    def _processar_feedback(self, comando: str) -> str | None:
+    def _resposta_rapida_personalizada(self, texto: str) -> str | None:
         """
-        Detecta quando o usuario corrige o Sirius e salva no RAG com qualidade 1.0.
-
-        Formatos reconhecidos:
-          "isso ta errado, a resposta certa e: X"
-          "errou, na verdade e: X"
-          "nao e isso, e: X"
-          "corrige isso: X"
-          "aprende isso: X"
-          "memoriza que X"
+        Versão personalizada da resposta rápida.
+        Usa o nome real do usuário nas saudações.
         """
-        t = comando.lower().strip()
+        resp = self._resposta_rapida(texto)
+        if not resp:
+            return None
+        if self._perfil:
+            nome = self._perfil.nome_usuario()
+            if nome and nome != "chefia":
+                resp = resp.replace("chefia", nome)
+        return resp
 
-        _TRIGGERS_CORRECAO = [
-            "ta errado", "esta errado", "errou",
-            "nao e isso", "na verdade e", "na verdade:",
-            "corrige isso", "aprende isso", "aprende que",
-            "memoriza que", "memoriza isso",
-            "a resposta certa e", "a resposta correta e",
-            "nao e assim", "e assim que funciona",
-        ]
-
-        _SEPARADORES = [":", "que", "e que", "seria", ", o correto e"]
-
-        for trigger in _TRIGGERS_CORRECAO:
-            if trigger in t:
-                # Extrai a parte correta apos o trigger ou separador
-                resto = t
-                # Remove o trigger
-                idx_trigger = t.find(trigger)
-                resto = t[idx_trigger + len(trigger):].strip()
-
-                # Remove separadores do inicio
-                for sep in [",", ".", " e ", " e:", ":", " é", " que"]:
-                    if resto.startswith(sep):
-                        resto = resto[len(sep):].strip()
-
-                if len(resto) > 10:
-                    # Recupera o ultimo comando do contexto (o que estava errado)
-                    pergunta_original = ""
-                    if self._contexto_sessao:
-                        for msg in reversed(self._contexto_sessao):
-                            if msg["role"] == "user" and msg["content"] != comando:
-                                pergunta_original = msg["content"]
-                                break
-
-                    # Salva no RAG com qualidade maxima
-                    if self._rag:
-                        self._rag.adicionar_feedback(
-                            pergunta=pergunta_original or comando,
-                            resposta_correta=resto
-                        )
-
-                    # Salva no banco direto tambem
-                    self.memoria.salvar_estudo_autonomo(
-                        tema=pergunta_original[:80] or "correcao",
-                        conteudo=resto,
-                        tags="feedback_usuario_qualidade_1"
-                    )
-
-                    print(f"[CEREBRO]: Feedback salvo: '{resto[:50]}'")
-                    return f"Anotado, chefia! Aprendi que: {resto[:200]}."
-
-        return None
+    def _personalizar_resposta_final(self, resposta: str) -> str:
+        """
+        Aplica as preferências de estilo do perfil na resposta final.
+        Chamado antes de retornar qualquer resposta de conhecimento.
+        """
+        if not self._perfil or not resposta:
+            return resposta
+        return self._perfil.personalizar_resposta(resposta)
 
     def _eh_falha(self, texto):
         return any(ind in texto.lower() for ind in INDICADORES_FALHA)
@@ -1345,6 +1302,14 @@ class SiriusCerebro:
         if not texto_lower:
             return None
 
+        # --- BLOQUEIO DE GRAVAÇÃO DE VOZ ---
+        # Durante gravar_amostras(), o usuário fala frases guia que contêm
+        # "Sirius". Sem esse bloqueio, essas frases viram comandos normais
+        # e geram respostas aleatórias por cima da gravação.
+        if self._gravando_voz:
+            print(f"\033[90m[CEREBRO]: Descartado (gravando voz): '{texto_lower[:40]}'\033[0m")
+            return None
+
         # Descarta transcrições ruins (eco, repetição, ruído do microfone)
         from collections import Counter as _Counter
         import re as _re
@@ -1370,9 +1335,11 @@ class SiriusCerebro:
         else:
             return None
 
-        # Sinaliza atividade ao scheduler
+        # Sinaliza atividade ao scheduler e ao monitor de concentração
         if self._scheduler:
             self._scheduler.registrar_atividade()
+        if self._proativo and hasattr(self._proativo, "registrar_atividade_usuario"):
+            self._proativo.registrar_atividade_usuario()
 
         # Adiciona ao contexto de sessão
         self._adicionar_contexto("user", comando)
@@ -1394,17 +1361,139 @@ class SiriusCerebro:
                 self._acao_pendente = None
                 return "Cancelado."
 
-        # --- FEEDBACK DE CORRECAO (alta prioridade) ---
-        # "Sirius, isso ta errado. A resposta certa e: X"
-        # Salva no RAG com qualidade 1.0 — ensina o Sirius
-        resp_feedback = self._processar_feedback(comando)
-        if resp_feedback:
-            self._adicionar_contexto("assistant", resp_feedback)
-            self.memoria.salvar_historico(comando, resp_feedback)
-            return resp_feedback
+        # --- CONTAS + VOZ ID (prioridade máxima — antes de qualquer classificador) ---
+        # Detector robusto que captura variações de infinitivo e frases completas
+        _cmd_n = _normalizar(comando)
 
-        # Resposta rápida instantânea
-        resp_rapida = self._resposta_rapida(comando)
+        _TRIGGERS_CONTA_DIRETO = {
+            # Criar conta
+            "cria conta", "criar conta", "nova conta", "crie conta",
+            "cria uma conta", "criar uma conta", "adicionar conta",
+            "cria conta para", "criar conta para", "nova conta para",
+            # Trocar conta / identificação
+            "sou eu o", "sou eu a", "eu sou o", "eu sou a",
+            "sou o", "sou a",  # "sou o carlos", "sou a maria"
+            "entrar como", "logar como", "mudar para", "trocar para",
+            "trocar de conta", "mudar de conta",
+            # Listar / status
+            "listar contas", "lista contas", "ver contas", "quais contas",
+            "quem esta usando", "qual conta", "quem sou eu",
+            # PIN
+            "define meu pin", "meu pin e", "remove meu pin", "tirar pin",
+            # Convidado
+            "conta convidado", "modo convidado", "entrar como convidado",
+        }
+        _TRIGGERS_VOZ_DIRETO = {
+            # Variações com infinitivo E imperativo
+            "registrar minha voz", "registra minha voz",
+            "cadastrar minha voz", "cadastra minha voz",
+            "gravar minha voz", "grava minha voz",
+            "treinar minha voz", "treina minha voz",
+            "aprender minha voz", "aprende minha voz",
+            "apagar minha voz", "apaga minha voz",
+            "remover minha voz", "remove minha voz",
+            "deletar minha voz", "deleta minha voz",
+            "minha voz", "reconhecimento de voz",
+            "status da voz", "voz cadastrada",
+        }
+
+        if any(tr in _cmd_n for tr in _TRIGGERS_CONTA_DIRETO):
+            if self._contas:
+                resp_conta = self._contas.processar_comando(comando)
+                if resp_conta:
+                    nova_conta = self._contas.conta_ativa
+                    self._perfil = self._contas.perfil_ativo
+                    if self._contas.memoria_ativa:
+                        self.memoria = self._contas.memoria_ativa
+                    self._adicionar_contexto("assistant", resp_conta)
+                    self.memoria.salvar_historico(comando, resp_conta)
+                    return resp_conta
+
+        if any(tr in _cmd_n for tr in _TRIGGERS_VOZ_DIRETO):
+            if self._voz_id:
+                conta_ativa = self._contas.conta_ativa if self._contas else None
+                resp_voz = self._voz_id.processar_comando(
+                    comando,
+                    conta_ativa=conta_ativa,
+                    callback_falar=getattr(self, "_callback_falar", None)
+                )
+                if resp_voz:
+                    self._adicionar_contexto("assistant", resp_voz)
+                    self.memoria.salvar_historico(comando, resp_voz)
+                    return resp_voz
+            else:
+                return (
+                    "Sistema de contas não está ativo. "
+                    "Verifique se sirius_contas.py está na pasta src/."
+                )
+
+        # --- CONTAS (prioridade máxima — PIN em andamento ou troca de conta) ---
+        if self._contas:
+            # Verifica bloqueio por tentativas erradas
+            if self._contas._auth.esta_bloqueado():
+                s = self._contas._auth.segundos_bloqueado()
+                return f"Conta bloqueada por {s}s devido a tentativas erradas de PIN."
+
+            # Fluxo de PIN ativo — qualquer entrada pode ser o PIN
+            if self._contas.aguardando_pin:
+                ok, resp_pin = self._contas.processar_pin(comando)
+                if resp_pin:
+                    if ok:
+                        self._perfil = self._contas.perfil_ativo
+                        if self._contas.memoria_ativa:
+                            self.memoria = self._contas.memoria_ativa
+                    self._adicionar_contexto("assistant", resp_pin)
+                    self.memoria.salvar_historico(comando, resp_pin)
+                    return resp_pin
+
+            # Comando de conta normal
+            elif self._contas.e_comando_conta(comando):
+                resp_conta = self._contas.processar_comando(comando)
+                if resp_conta:
+                    nova_conta = self._contas.conta_ativa
+                    self._perfil = self._contas.perfil_ativo
+                    if self._contas.memoria_ativa:
+                        self.memoria = self._contas.memoria_ativa
+                    self._adicionar_contexto("assistant", resp_conta)
+                    self.memoria.salvar_historico(comando, resp_conta)
+                    return resp_conta
+
+        # --- VOZ ID — comandos de registro/status de voz ---
+        if self._voz_id and self._voz_id.e_comando_voz(comando):
+            conta_ativa = self._contas.conta_ativa if self._contas else None
+            # callback_travar_cerebro: liga/desliga _gravando_voz durante gravação.
+            # Com _gravando_voz=True, processar() descarta tudo sem responder,
+            # evitando que as frases guia virem respostas aleatórias.
+            def _travar_cerebro(ligar: bool):
+                self._gravando_voz = ligar
+                estado = "TRAVADO" if ligar else "DESTRAVADO"
+                print(f"\033[94m[CEREBRO]: {estado} (gravação de voz).\033[0m")
+
+            resp_voz = self._voz_id.processar_comando(
+                comando,
+                conta_ativa               = conta_ativa,
+                callback_falar            = getattr(self, "_callback_falar", None),
+                callback_travar_cerebro   = _travar_cerebro
+            )
+            if resp_voz:
+                self._adicionar_contexto("assistant", resp_voz)
+                self.memoria.salvar_historico(comando, resp_voz)
+                return resp_voz
+
+        # --- PERFIL (alta prioridade) ---
+        if self._perfil and self._perfil.e_comando_perfil(comando):
+            resp_perfil = self._perfil.processar_comando(comando)
+            if resp_perfil:
+                self._adicionar_contexto("assistant", resp_perfil)
+                self.memoria.salvar_historico(comando, resp_perfil)
+                return resp_perfil
+
+        # Registra uso para aprender preferências implícitas
+        if self._perfil:
+            self._perfil.registrar_uso(comando)
+
+        # Resposta rápida instantânea — personaliza com nome do usuário
+        resp_rapida = self._resposta_rapida_personalizada(comando)
         if resp_rapida:
             self._adicionar_contexto("assistant", resp_rapida)
             self.memoria.salvar_historico(comando, resp_rapida)
@@ -1441,35 +1530,22 @@ class SiriusCerebro:
             threading.Thread(target=_treinar, daemon=True).start()
             return "Certo, vou evoluir meu cerebro agora! Isso leva alguns minutos."
 
-        # --- Rebuild do RAG manual ---
-        if any(p in _normalizar(comando) for p in [
-            "rebuilda o rag", "reconstroi o rag", "rebuild rag",
-            "atualiza o rag", "reconstroi meu banco",
-            "atualiza minha memoria", "indexa o banco"
+        # --- PERFIL E CONTAS (comandos de status) ---
+        cmd_norm = _normalizar(comando)
+        if any(p in cmd_norm for p in [
+            "status do perfil", "meu perfil", "ver perfil",
+            "minhas preferencias", "minhas preferências",
         ]):
-            if self._rag:
-                def _rebuild():
-                    ok = self._rag.rebuild()
-                    print("[CEREBRO]: RAG rebuild {}".format("OK" if ok else "falhou"))
-                threading.Thread(target=_rebuild, daemon=True).start()
-                s = self._rag.status()
-                return (f"Rebuilding o RAG com {s['docs_no_banco']} documentos. "
-                        f"Fica pronto em alguns segundos.")
-            return "RAG nao disponivel. Instale: pip install faiss-cpu"
+            if self._perfil:
+                return self._perfil._formatar_perfil()
 
-        # --- Status do RAG ---
-        if any(p in _normalizar(comando) for p in [
-            "status do rag", "status rag", "quantos documentos", "quantos docs",
-            "tamanho do banco rag", "rag ta funcionando"
+        if any(p in cmd_norm for p in [
+            "status das contas", "listar contas", "lista contas",
+            "quais contas existem", "ver contas", "status contas",
         ]):
-            if self._rag:
-                s = self._rag.status()
-                return (
-                    f"RAG: {'ativo' if s['indice_construido'] else 'sem indice'}. "
-                    f"{s['docs_no_indice']} docs indexados / {s['docs_no_banco']} no banco. "
-                    f"{'Indice desatualizado — rebuilda logo.' if s['indice_desatualizado'] else 'Indice atualizado.'}"
-                )
-            return "RAG nao disponivel."
+            if self._contas:
+                return self._contas._listar_contas()
+            return "Sistema de contas não disponível."
 
         # --- Arquivo mencionado? ---
         resposta_arquivo = self._tentar_ler_arquivo(comando)
@@ -1532,13 +1608,13 @@ class SiriusCerebro:
             self.memoria.salvar_amostra_treino(comando, resposta_agente)
             return resposta_final
 
-        # --- Conhecimento / conversa (RAG + agentes + gerador) ---
-        resposta_ia = _responder_conhecimento(
-            comando_enriquecido, self.memoria, rag=self._rag
-        )
+        # --- Conhecimento / conversa (gerador + embeddings) ---
+        resposta_ia = _responder_conhecimento(comando_enriquecido, self.memoria)
 
         if resposta_ia and not self._eh_falha(resposta_ia):
-            resposta_final = self.filtro.aplicar_zoeira(resposta_ia)
+            resposta_zoeira = self.filtro.aplicar_zoeira(resposta_ia)
+            # Aplica estilo do perfil (curto/normal/detalhado, sem gírias etc.)
+            resposta_final = self._personalizar_resposta_final(resposta_zoeira)
         else:
             _nao_estudavel = any(p in comando for p in [
                 "que horas", "que dia", "qual data", "tudo bem", "como voce",

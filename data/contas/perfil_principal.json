@@ -1,0 +1,25 @@
+{
+  "nome": "chefia",
+  "pronome": "você",
+  "cidade": "Guarulhos",
+  "navegador": "",
+  "editor": "",
+  "musica_app": "",
+  "terminal": "",
+  "hora_trabalho_inicio": 8,
+  "hora_trabalho_fim": 18,
+  "hora_dormir": 23,
+  "temas_favoritos": [],
+  "apps_favoritos": {
+    "perfil": 1
+  },
+  "estilo_resposta": "normal",
+  "usar_girias": true,
+  "briefing_ativo": true,
+  "briefing_clima": true,
+  "briefing_lembretes": true,
+  "criado_em": "2026-04-18T12:29:04.102380",
+  "ultima_sessao": "2026-04-19T13:41:44.185305",
+  "total_sessoes": 5,
+  "total_mensagens": 276
+}

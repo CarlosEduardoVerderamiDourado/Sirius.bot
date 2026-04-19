@@ -56,13 +56,14 @@ class KokoroTTS:
 
     def _inicializar(self):
         try:
-            from kokoro import KPipeline
-            # pt → português (usa modelo multilingual)
-            self._pipeline   = KPipeline(lang_code="p")
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                from kokoro import KPipeline
+                self._pipeline   = KPipeline(lang_code="p")
             self._voz        = self.VOZES_PTBR[0]
             self._disponivel = True
             print(f"\033[92m[TTS]: Kokoro carregado — voz '{self._voz}' ativa.\033[0m")
-            print(f"\033[92m[TTS]: Voz neural local, zero custo, qualidade premium.\033[0m")
         except ImportError:
             print("\033[33m[TTS]: Kokoro não instalado. pip install kokoro soundfile sounddevice\033[0m")
         except Exception as e:
@@ -77,27 +78,38 @@ class KokoroTTS:
             try:
                 import sounddevice as sd
                 import numpy as np
+                import warnings
 
                 samples = []
-                generator = self._pipeline(
-                    texto,
-                    voice=self._voz,
-                    speed=1.05,       # levemente mais rápido que natural
-                    split_pattern=r'\n+'
-                )
-
-                for _, _, audio in generator:
-                    if audio is not None:
-                        samples.append(audio)
+                # Suprime warnings do PyTorch sobre dropout/weight_norm
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    generator = self._pipeline(
+                        texto,
+                        voice=self._voz,
+                        speed=1.05,
+                        split_pattern=r'\n+'
+                    )
+                    for _, _, audio in generator:
+                        if audio is not None:
+                            samples.append(audio)
 
                 if not samples:
+                    print("[TTS Kokoro]: Nenhum áudio gerado.")
                     return False
 
                 audio_final = np.concatenate(samples)
 
-                # Reproduz direto
-                sd.play(audio_final, samplerate=24000)
-                sd.wait()
+                # Verifica se sounddevice tem dispositivo disponível
+                try:
+                    dispositivos = sd.query_devices()
+                    if not dispositivos:
+                        print("[TTS Kokoro]: Nenhum dispositivo de áudio.")
+                        return False
+                except Exception:
+                    pass
+
+                sd.play(audio_final, samplerate=24000, blocking=True)
                 return True
 
             except Exception as e:
