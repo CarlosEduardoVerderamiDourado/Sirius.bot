@@ -28,20 +28,26 @@ from datetime import datetime, timedelta
 # Cache simples (evita requests repetidos em menos de 10min)
 # ---------------------------------------------------------------------------
 
-_cache = {}            # chave -> (timestamp, valor)
-_CACHE_TTL = 600       # 10 minutos em segundos
+_cache = {}
+_CACHE_TTL_CLIMA   = 900   # clima: 15 min (mudanças lentas)
+_CACHE_TTL_PADRAO  = 600   # outros: 10 min
 _lock_cache = threading.Lock()
 
+# Cidade em memória permanente — detectada uma vez, nunca mais faz HTTP
+_cidade_detectada_permanente: str = ""
 
-def _cache_get(chave):
+
+def _cache_get(chave: str, ttl: int = None) -> str | None:
     with _lock_cache:
         entrada = _cache.get(chave)
-        if entrada and (time.time() - entrada[0]) < _CACHE_TTL:
-            return entrada[1]
+        if entrada:
+            _ttl = ttl or (_CACHE_TTL_CLIMA if "clima" in chave else _CACHE_TTL_PADRAO)
+            if (time.time() - entrada[0]) < _ttl:
+                return entrada[1]
     return None
 
 
-def _cache_set(chave, valor):
+def _cache_set(chave: str, valor: str):
     with _lock_cache:
         _cache[chave] = (time.time(), valor)
 
@@ -113,33 +119,37 @@ _cidade_padrao = None  # cache da cidade detectada por IP
 
 
 def _detectar_cidade_por_ip() -> str:
-    """Detecta a cidade aproximada pelo IP do usuario. Usa ip-api.com (gratuito)."""
-    global _cidade_padrao
-    if _cidade_padrao:
-        return _cidade_padrao
+    """
+    Detecta a cidade pelo IP do usuário.
+    Faz HTTP apenas UMA vez por sessão — resultado fica em RAM para sempre.
+    """
+    global _cidade_padrao, _cidade_detectada_permanente
 
-    chave = "cidade_ip"
-    cached = _cache_get(chave)
-    if cached:
-        _cidade_padrao = cached
-        return cached
+    # Já detectada nesta sessão — retorna imediatamente sem I/O
+    if _cidade_detectada_permanente:
+        return _cidade_detectada_permanente
+    if _cidade_padrao:
+        _cidade_detectada_permanente = _cidade_padrao
+        return _cidade_padrao
 
     try:
         import urllib.request
-        url  = "http://ip-api.com/json/?fields=city,regionName,country&lang=pt-BR"
-        req  = urllib.request.Request(url, headers={"User-Agent": "Sirius/1.0"})
+        url = "http://ip-api.com/json/?fields=city,regionName,country&lang=pt-BR"
+        req = urllib.request.Request(url, headers={"User-Agent": "Sirius/1.0"})
         with urllib.request.urlopen(req, timeout=4) as r:
             dados = json.loads(r.read().decode())
         cidade = dados.get("city", "")
         if cidade:
-            _cache_set(chave, cidade)
+            _cidade_detectada_permanente = cidade
             _cidade_padrao = cidade
-            print("[TEMPO REAL]: Cidade detectada por IP: {}".format(cidade))
+            _cache_set("cidade_ip", cidade)
+            print("[TEMPO REAL]: Cidade detectada: {}".format(cidade))
             return cidade
     except Exception as e:
-        print("[TEMPO REAL]: Falha ao detectar cidade por IP: {}".format(e))
+        print("[TEMPO REAL]: Falha ao detectar cidade: {}".format(e))
 
-    return "Sao Paulo"  # fallback final
+    _cidade_detectada_permanente = "Sao Paulo"
+    return "Sao Paulo"
 
 
 # ---------------------------------------------------------------------------
@@ -408,37 +418,82 @@ def obter_temperatura(cidade: str = None) -> str:
 # Parser principal — detecta intencao e chama a funcao certa
 # ---------------------------------------------------------------------------
 
-# Palavras-chave que ativam esta funcao
-TRIGGERS_HORA = {
+# ---------------------------------------------------------------------------
+# Triggers como frozensets — verificação O(1) por elemento
+# ---------------------------------------------------------------------------
+
+TRIGGERS_HORA: frozenset = frozenset({
     "que horas", "que hora", "horas sao", "hora e", "hora sao",
     "que horas e", "me diz a hora", "me fala a hora", "hora atual",
     "horas agora"
-}
+})
 
-TRIGGERS_DATA = {
+TRIGGERS_DATA: frozenset = frozenset({
     "que dia", "qual dia", "que data", "qual data", "dia e hoje",
     "dia de hoje", "data de hoje", "data atual", "que mes",
     "qual mes", "que ano", "qual ano"
-}
+})
 
-TRIGGERS_CLIMA = {
+TRIGGERS_CLIMA: frozenset = frozenset({
     "clima", "tempo", "temperatura", "chuva", "vai chover",
-    "chover hoje", "chover amanha", "previsao", "previsão",
+    "chover hoje", "chover amanha", "previsao", "previsao",
     "como esta o tempo", "como ta o tempo", "faz frio",
     "faz calor", "esta frio", "esta quente", "ta frio", "ta quente",
     "graus", "celsius", "umidade", "vento", "tempestade",
     "nublado", "sol hoje", "sol amanha"
-}
+})
+
+# Subconjuntos usados dentro de processar_tempo_real — frozensets de módulo
+# (antes eram listas inline criadas a cada chamada)
+_TR_VAI_CHOVER: frozenset = frozenset({
+    "vai chover", "chover hoje", "vai ter chuva",
+    "chance de chuva", "previsao de chuva"
+})
+_TR_AMANHA: frozenset = frozenset({
+    "amanha", "amanha", "proximo dia", "proximo dias"
+})
+_TR_3DIAS: frozenset = frozenset({"proximos 3", "3 dias"})
+_TR_HOJE:  frozenset = frozenset({"hoje", "agora", "atual"})
+_TR_TEMP:  frozenset = frozenset({
+    "temperatura", "graus", "celsius",
+    "faz frio", "faz calor", "ta frio",
+    "ta quente", "esta frio", "esta quente"
+})
+
+
+def _make_verificador(*conjuntos: frozenset):
+    """
+    Factory de funções de verificação de trigger.
+
+    Retorna uma função (texto: str) → bool que verifica se o texto
+    contém qualquer elemento de QUALQUER dos conjuntos fornecidos.
+
+    Uso:
+        _e_hora  = _make_verificador(TRIGGERS_HORA)
+        _e_clima = _make_verificador(TRIGGERS_CLIMA, TRIGGERS_HORA)
+
+    Vantagem sobre any(...) inline:
+      - Calcula t.lower() uma única vez
+      - Reutilizável sem repetir a lógica
+      - Permite combinar múltiplos conjuntos em uma chamada
+    """
+    todos = frozenset().union(*conjuntos)
+    def _verificar(texto: str) -> bool:
+        t = texto.lower()
+        return any(kw in t for kw in todos)
+    return _verificar
+
+
+# Verificadores prontos — usados em _e_pergunta_tempo_real e processar_tempo_real
+_e_hora_fn  = _make_verificador(TRIGGERS_HORA)
+_e_data_fn  = _make_verificador(TRIGGERS_DATA)
+_e_clima_fn = _make_verificador(TRIGGERS_CLIMA)
 
 
 def _e_pergunta_tempo_real(texto: str) -> bool:
     """Retorna True se o texto parece ser uma pergunta de hora/clima."""
     t = texto.lower()
-    return (
-        any(kw in t for kw in TRIGGERS_HORA) or
-        any(kw in t for kw in TRIGGERS_DATA) or
-        any(kw in t for kw in TRIGGERS_CLIMA)
-    )
+    return _e_hora_fn(t) or _e_data_fn(t) or _e_clima_fn(t)
 
 
 def processar_tempo_real(texto: str) -> str | None:
@@ -449,49 +504,35 @@ def processar_tempo_real(texto: str) -> str | None:
     t = texto.lower().strip()
 
     # --- HORA ---
-    if any(kw in t for kw in TRIGGERS_HORA):
+    if _e_hora_fn(t):
         return obter_hora_atual()
 
     # --- DATA ---
-    if any(kw in t for kw in TRIGGERS_DATA):
-        # Se tambem pedir hora junto
-        if any(kw in t for kw in TRIGGERS_HORA):
+    if _e_data_fn(t):
+        if _e_hora_fn(t):   # pediu hora junto
             return obter_data_e_hora()
         return obter_data_atual()
 
     # --- CLIMA ---
-    if any(kw in t for kw in TRIGGERS_CLIMA):
+    if _e_clima_fn(t):
         cidade = _extrair_cidade_do_texto(t)
 
-        # "vai chover" / "vai chover hoje/amanha"
-        if any(p in t for p in ["vai chover", "chover hoje", "vai ter chuva",
-                                  "chance de chuva", "previsao de chuva"]):
+        if any(kw in t for kw in _TR_VAI_CHOVER):
             return vai_chover(cidade)
 
-        # Previsao amanha
-        if any(p in t for p in ["amanha", "amanhã", "proximo dia", "proximo dias"]):
-            dias = 1
-            if any(p in t for p in ["proximos 3", "3 dias"]):
-                # Retorna os 3 proximos dias
+        if any(kw in t for kw in _TR_AMANHA):
+            if any(kw in t for kw in _TR_3DIAS):
                 if not cidade:
                     cidade = _detectar_cidade_por_ip()
-                partes = []
-                for d in range(3):
-                    partes.append(obter_previsao(cidade, d))
-                return "\n".join(partes)
+                return "\n".join(obter_previsao(cidade, d) for d in range(3))
             return obter_previsao(cidade, dias=1)
 
-        # Previsao hoje
-        if any(p in t for p in ["hoje", "agora", "atual"]):
+        if any(kw in t for kw in _TR_HOJE):
             return obter_previsao(cidade, dias=0)
 
-        # So temperatura
-        if any(p in t for p in ["temperatura", "graus", "celsius",
-                                  "faz frio", "faz calor", "ta frio",
-                                  "ta quente", "esta frio", "esta quente"]):
+        if any(kw in t for kw in _TR_TEMP):
             return obter_temperatura(cidade)
 
-        # Clima geral (default)
         return obter_clima_atual(cidade)
 
     return None

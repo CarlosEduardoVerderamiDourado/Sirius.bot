@@ -570,10 +570,12 @@ class SiriusProativo:
         self._rodando  = False
         self._thread   = None
 
-        self._monitor_sistema = MonitorSistema()
-        self._monitor_clima   = MonitorClima()
-        self._monitor_hora    = MonitorHora()
-        self._briefing        = BriefingMatinal(self._lembretes)
+        self._monitor_sistema   = MonitorSistema()
+        self._monitor_clima     = MonitorClima()
+        self._monitor_hora      = MonitorHora()
+        self._monitor_foco      = MonitorConcentracao()   # rastreia uso contínuo
+        self._monitor_processos = MonitorProcessos()      # processos pesados
+        self._briefing          = BriefingMatinal(self._lembretes)
 
         self._carregar()
 

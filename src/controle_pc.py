@@ -8,12 +8,16 @@ import re
 import time
 import shutil
 import subprocess
+import unicodedata
+from functools import lru_cache
 import pyperclip
 import pyautogui
 import pygetwindow as gw
 
+# Reduzido de 0.3 para 0.1 — pyautogui.PAUSE é aplicado a CADA ação
+# 0.3 × 10 ações = 3s de overhead desnecessário em automações longas
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE    = 0.3
+pyautogui.PAUSE    = 0.08
 
 # ---------------------------------------------------------------------------
 # Apps de mensagens suportados (nicho fixo)
@@ -212,21 +216,66 @@ class SiriusControl:
     # JANELAS
     # -----------------------------------------------------------------------
 
-    def _forcar_foco(self, titulo_parte):
+    # ─────────────────────────────────────────────────────────────────────
+    # Utilitários de janela — centralizam busca e operações repetidas
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _encontrar_janela(self, titulo_parte: str):
+        """
+        Busca e retorna a primeira janela que contém titulo_parte no título.
+        Centraliza o loop 'for j in gw.getAllWindows()' que estava duplicado
+        em fechar_janela, minimizar_janela, maximizar_janela e _forcar_foco.
+        Retorna o objeto janela ou None.
+        """
+        titulo_lower = titulo_parte.lower()
+        for j in gw.getAllWindows():
+            if j.title.strip() and titulo_lower in j.title.lower():
+                return j
+        return None
+
+    def _operacao_janela(self, titulo_parte: str,
+                          fn_acao,
+                          msg_ok: str,
+                          msg_erro: str) -> str:
+        """
+        Factory de operação de janela.
+
+        Encapsula o padrão repetido:
+          1. Encontra a janela
+          2. Executa fn_acao(janela)
+          3. Retorna msg_ok ou msg_erro formatada
+
+        Uso:
+          return self._operacao_janela(
+              titulo_parte,
+              fn_acao  = lambda j: j.minimize(),
+              msg_ok   = "Minimizei '{titulo}'.",
+              msg_erro = "Não achei janela com '{titulo}'.",
+          )
+
+        msg_ok e msg_erro aceitam {titulo} como placeholder.
+        """
         try:
-            alvo = None
-            for j in gw.getAllWindows():
-                if titulo_parte.lower() in j.title.lower() and j.title.strip():
-                    alvo = j
-                    break
-            if not alvo:
+            j = self._encontrar_janela(titulo_parte)
+            if not j:
+                return msg_erro.format(titulo=titulo_parte)
+            fn_acao(j)
+            return msg_ok.format(titulo=j.title)
+        except Exception as e:
+            return f"Erro na operação de janela: {e}"
+
+    def _forcar_foco(self, titulo_parte: str) -> bool:
+        """Foca a janela — retorna True se conseguiu."""
+        try:
+            j = self._encontrar_janela(titulo_parte)
+            if not j:
                 return False
-            if alvo.isMinimized:
-                alvo.restore()
-                time.sleep(0.4)
-            alvo.activate()
-            time.sleep(0.4)
-            self._ultima_janela_focada = alvo.title
+            if j.isMinimized:
+                j.restore()
+                time.sleep(0.15)
+            j.activate()
+            time.sleep(0.15)
+            self._ultima_janela_focada = j.title
             return True
         except Exception:
             return False
@@ -240,35 +289,29 @@ class SiriusControl:
         except Exception as e:
             return "Erro ao listar janelas: " + str(e)
 
-    def fechar_janela(self, titulo_parte):
-        try:
-            for j in gw.getAllWindows():
-                if titulo_parte.lower() in j.title.lower() and j.title.strip():
-                    j.close()
-                    return "Fechei '{}'.".format(j.title)
-            return "Nao achei janela com '{}' pra fechar.".format(titulo_parte)
-        except Exception as e:
-            return "Erro ao fechar janela: " + str(e)
+    def fechar_janela(self, titulo_parte: str) -> str:
+        return self._operacao_janela(
+            titulo_parte,
+            fn_acao  = lambda j: j.close(),
+            msg_ok   = "Fechei '{titulo}'.",
+            msg_erro = "Nao achei janela com '{titulo}' pra fechar.",
+        )
 
-    def minimizar_janela(self, titulo_parte):
-        try:
-            for j in gw.getAllWindows():
-                if titulo_parte.lower() in j.title.lower() and j.title.strip():
-                    j.minimize()
-                    return "Minimizei '{}'.".format(j.title)
-            return "Nao achei janela com '{}'.".format(titulo_parte)
-        except Exception as e:
-            return "Erro ao minimizar: " + str(e)
+    def minimizar_janela(self, titulo_parte: str) -> str:
+        return self._operacao_janela(
+            titulo_parte,
+            fn_acao  = lambda j: j.minimize(),
+            msg_ok   = "Minimizei '{titulo}'.",
+            msg_erro = "Nao achei janela com '{titulo}'.",
+        )
 
-    def maximizar_janela(self, titulo_parte):
-        try:
-            for j in gw.getAllWindows():
-                if titulo_parte.lower() in j.title.lower() and j.title.strip():
-                    j.maximize()
-                    return "Maximizei '{}'.".format(j.title)
-            return "Nao achei janela com '{}'.".format(titulo_parte)
-        except Exception as e:
-            return "Erro ao maximizar: " + str(e)
+    def maximizar_janela(self, titulo_parte: str) -> str:
+        return self._operacao_janela(
+            titulo_parte,
+            fn_acao  = lambda j: j.maximize(),
+            msg_ok   = "Maximizei '{titulo}'.",
+            msg_erro = "Nao achei janela com '{titulo}'.",
+        )
 
     def mover_janela(self, titulo_parte, direcao="direita"):
         try:
@@ -527,7 +570,7 @@ class SiriusControl:
 
     def digitar_texto(self, texto):
         try:
-            time.sleep(0.3)
+            time.sleep(0.1)
             pyautogui.typewrite(texto, interval=0.05)
             return "Digitei: '{}'".format(texto[:60])
         except Exception as e:
@@ -620,25 +663,25 @@ class SiriusControl:
             )
 
         # Pequena pausa apos foco para garantir que a UI esta pronta
-        time.sleep(0.5)
+        time.sleep(0.2)
         pyautogui.press("escape")
-        time.sleep(0.3)
+        time.sleep(0.1)
 
         # Abre a busca de contato
         pyautogui.hotkey(*app["atalho_busca"])
-        time.sleep(0.6)
+        time.sleep(0.25)
 
         # Cola o nome do destinatario
         pyperclip.copy(destinatario)
         pyautogui.hotkey("ctrl", "v")
-        time.sleep(1.5)
+        time.sleep(0.7)
         pyautogui.press("enter")
-        time.sleep(1.0)
+        time.sleep(0.7)
 
         # Cola a mensagem e envia
         pyperclip.copy(mensagem)
         pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.3)
+        time.sleep(0.1)
         pyautogui.press("enter")
 
         return "Mensagem enviada para {} no {}.".format(destinatario, plataforma)

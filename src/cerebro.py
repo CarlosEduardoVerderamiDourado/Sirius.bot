@@ -1040,11 +1040,16 @@ class SiriusCerebro:
         self._tempo_real = None
         self._contas     = None   # Sistema de múltiplas contas
         self._perfil     = None   # Perfil da conta ativa
+        self._apps       = None   # Controle de apps externos
+        self._paralelo   = None   # Execução paralela de tarefas
+        self._camera     = None   # Visão por câmera
 
         # Flag de bloqueio durante gravação de amostras de voz.
-        # Enquanto True, processar() descarta tudo sem responder —
-        # evita que as frases guia ("Ei Sirius...") virem comandos.
         self._gravando_voz = False
+
+        # Callbacks de UI — injetados pela janela ativa (normal ou wallpaper)
+        self._callback_falar = None
+        self._callback_log   = None
 
         # --- Contexto de sessão em RAM (últimas N trocas) ---
         self._contexto_sessao: list[dict] = []
@@ -1147,11 +1152,85 @@ class SiriusCerebro:
             self._moe = None
             print(f"[CEREBRO]: MoE indisponível: {e}")
 
+        # Paralelo — execução simultânea de múltiplas tarefas
+        try:
+            from sirius_paralelo import SiriusParalelo
+            self._paralelo = SiriusParalelo()
+            print("\033[92m[CEREBRO]: Sistema de execução paralela ativo.\033[0m")
+        except Exception as e:
+            self._paralelo = None
+            print(f"[CEREBRO]: Paralelo indisponível: {e}")
+
+        # Apps externos — Spotify, YouTube, WhatsApp, Discord, navegador, etc.
+        try:
+            from sirius_apps import SiriusApps
+            self._apps = SiriusApps()
+            print("\033[92m[CEREBRO]: Controle de aplicativos externos ativo.\033[0m")
+        except Exception as e:
+            self._apps = None
+            print(f"[CEREBRO]: Apps externos indisponível: {e}")
+
+        # Câmera — identificação facial, QR code, expressões
+        try:
+            from sirius_camera import SiriusCamera
+            self._camera = SiriusCamera(
+                contas=self._contas,
+                callback_troca_conta=self._ao_identificar_rosto
+            )
+            # Inicia monitor passivo apenas se houver rostos cadastrados
+            if self._camera._identificador.tem_rostos:
+                self._camera.iniciar_monitor()
+            print("\033[92m[CEREBRO]: Sistema de câmera ativo.\033[0m")
+        except Exception as e:
+            self._camera = None
+            print(f"[CEREBRO]: Câmera indisponível: {e}")
+
+    def registrar_callback(self, callback_falar=None, callback_log=None):
+        """
+        Injeta callbacks de UI.
+        Chamado tanto pela interface normal (interface.py) quanto
+        pelo papel de parede (sirius_wallpaper.py) após inicializar.
+        """
+        if callback_falar:
+            self._callback_falar = callback_falar
+        if callback_log:
+            self._callback_log = callback_log
+        # Repassa para módulos que precisam falar diretamente
+        if hasattr(self, "_proativo") and self._proativo:
+            self._proativo.registrar_callback(
+                callback_falar=callback_falar,
+                callback_log=callback_log
+            )
+        if hasattr(self, "_paralelo") and self._paralelo:
+            self._paralelo.registrar_callbacks(
+                callback_log=callback_log,
+                callback_falar=callback_falar
+            )
+
     def _registrar_scheduler(self, coordenador, treinador):
         """Chamado pelo main após inicializar coordenador e treinador."""
         if self._scheduler:
             self._scheduler.registrar_coordenador(coordenador)
             self._scheduler.registrar_treinador(treinador)
+
+    def _ao_identificar_rosto(self, conta_id: str, nome: str, confianca: float):
+        """
+        Callback chamado pelo monitor da câmera quando reconhece um rosto.
+        Troca a conta ativa automaticamente e notifica.
+        """
+        try:
+            if self._contas:
+                ok, _ = self._contas.trocar_conta(nome)
+                if ok:
+                    if self._contas.memoria_ativa:
+                        self.memoria = self._contas.memoria_ativa
+                    self._perfil = self._contas.perfil_ativo
+                    msg = f"Reconheci você, {nome}."
+                    print(f"\033[94m[CEREBRO]: Câmera → conta trocada para '{nome}' ({confianca:.0%}).\033[0m")
+                    if hasattr(self, "_callback_falar") and self._callback_falar:
+                        self._callback_falar(msg)
+        except Exception as e:
+            print(f"[CEREBRO]: Erro ao trocar conta por rosto: {e}")
 
     def _extrair_comando(self, texto):
         limpo = re.sub(r"[,!\.\s]*sirius[,!\.\s]*", " ", texto).strip()
@@ -1185,6 +1264,43 @@ class SiriusCerebro:
         if not self._perfil or not resposta:
             return resposta
         return self._perfil.personalizar_resposta(resposta)
+
+    def _processar_acao_simples(self, comando: str):
+        """
+        Processa um sub-comando simples sem entrar no loop de detecção paralela.
+        Usado pelo SiriusParalelo para evitar recursão infinita.
+
+        Ordem: apps externos → controle PC → agentes → MoE
+        """
+        # Apps externos primeiro (Spotify, YouTube, WhatsApp, etc.)
+        try:
+            if self._apps and self._apps.e_comando_app(comando):
+                r = self._apps.processar(comando)
+                if r: return r
+        except Exception:
+            pass
+        # Controle do PC (abrir/fechar apps, volume, etc.)
+        try:
+            from controle_pc import _parsear_controle_pc
+            r = _parsear_controle_pc(comando, self.control)
+            if r: return r
+        except Exception:
+            pass
+        # Agentes (pesquisa, Wikipedia, etc.)
+        try:
+            if self._agentes:
+                r = self._agentes.executar(comando)
+                if r and not self._eh_falha(r): return r
+        except Exception:
+            pass
+        # MoE — especialistas de domínio
+        try:
+            if self._moe:
+                r = self._moe.processar(comando, "")
+                if r and not self._eh_falha(r): return r
+        except Exception:
+            pass
+        return None
 
     def _eh_falha(self, texto):
         return any(ind in texto.lower() for ind in INDICADORES_FALHA)
@@ -1281,15 +1397,44 @@ class SiriusCerebro:
             "e sobre", "e esse", "e ela", "e ele",
         ])
 
+    def tarefa_background(self, fn, nome: str = "",
+                           callback=None) -> None:
+        """
+        Submete uma tarefa para rodar em background sem bloquear a conversa.
+        Usado por módulos internos (autodidata, agentes, etc.)
+
+        Exemplo:
+            self.tarefa_background(
+                fn=lambda: pesquisar_e_aprender(tema),
+                nome=f"Pesquisa '{tema}'",
+                callback=lambda r: audio.falar("Pesquisa concluída.")
+            )
+        """
+        if self._paralelo:
+            self._paralelo.background(fn, nome=nome, callback=callback)
+        else:
+            # Fallback sem o módulo paralelo — thread daemon simples
+            t = threading.Thread(target=fn, daemon=True)
+            t.start()
+
     def registrar_callback_fala(self, callback_falar):
         """Injeta o callback de fala no módulo proativo (chamado pelo main/interface)."""
         if self._proativo:
             self._proativo._falar = callback_falar
+        # Paralelo também precisa do callback para notificar quando tarefas terminam
+        if self._paralelo:
+            self._paralelo.registrar_callbacks(callback_falar=callback_falar)
+        self._callback_falar = callback_falar
 
     def registrar_callback(self, callback_falar=None, callback_log=None):
         """Alias compatível com a assinatura do sirius_proativo.registrar_callback."""
         if self._proativo:
             self._proativo.registrar_callback(
+                callback_falar=callback_falar,
+                callback_log=callback_log
+            )
+        if self._paralelo:
+            self._paralelo.registrar_callbacks(
                 callback_falar=callback_falar,
                 callback_log=callback_log
             )
@@ -1518,17 +1663,64 @@ class SiriusCerebro:
                 self.memoria.salvar_historico(comando, resp_proativo)
                 return resp_proativo
 
+        # --- CÂMERA — identificação facial, QR code, expressões ---
+        # Interceptado antes do classificador para que "quem está na minha frente"
+        # não vire pesquisa de conhecimento
+        if self._camera and self._camera.e_comando_camera(comando):
+            conta_ativa = self._contas.conta_ativa if self._contas else None
+            resp_cam    = self._camera.processar_comando(
+                comando,
+                conta_ativa    = conta_ativa,
+                callback_falar = getattr(self, "_callback_falar", None)
+            )
+            if resp_cam:
+                self._adicionar_contexto("assistant", resp_cam)
+                self.memoria.salvar_historico(comando, resp_cam)
+                return resp_cam
+
+        # --- PARALELO — status/cancelamento de tarefas ---
+        if self._paralelo and self._paralelo.e_comando_paralelo(comando):
+            resp_par = self._paralelo.processar_comando(comando)
+            if resp_par:
+                self._adicionar_contexto("assistant", resp_par)
+                self.memoria.salvar_historico(comando, resp_par)
+                return resp_par
+
+        # --- PARALELO — detecta se o comando pede múltiplas ações simultâneas ---
+        # Exemplos: "abre o chrome e o spotify ao mesmo tempo"
+        #           "pesquisa python e depois abre o vscode"
+        if self._paralelo and self._paralelo.detectar_paralelismo(comando):
+            resp_par = self._paralelo.processar_paralelo(comando, self)
+            if resp_par:
+                self._adicionar_contexto("assistant", resp_par)
+                self.memoria.salvar_historico(comando, resp_par)
+                return resp_par
+
+        # --- APPS EXTERNOS (Spotify, YouTube, WhatsApp, Discord...) ---
+        # Verificado antes do classificador para que "toca uma música"
+        # não caia no parser de controle de PC
+        if self._apps and self._apps.e_comando_app(comando):
+            resp_app = self._apps.processar(comando)
+            if resp_app:
+                self._adicionar_contexto("assistant", resp_app)
+                self.memoria.salvar_historico(comando, resp_app)
+                return resp_app
+
         print("[CEREBRO]: Classificando: '{}'".format(comando))
         intencao = _classificar_intencao(comando, self.neuronio)
         print("[CEREBRO]: Intencao -> {}".format(intencao))
 
         # --- Retreino ---
         if intencao == "treinar":
-            def _treinar():
-                from sirius_treinador import SiriusTreinador
-                SiriusTreinador().treinar_tudo()
-            threading.Thread(target=_treinar, daemon=True).start()
-            return "Certo, vou evoluir meu cerebro agora! Isso leva alguns minutos."
+            self.tarefa_background(
+                fn=lambda: __import__("sirius_treinador").SiriusTreinador().treinar_tudo(),
+                nome="Treino das redes neurais",
+                callback=lambda _: (
+                    self._callback_falar("Treino concluído, chefe.")
+                    if hasattr(self, "_callback_falar") and self._callback_falar else None
+                )
+            )
+            return "Iniciando evolução do cérebro. Vou avisar quando terminar."
 
         # --- PERFIL E CONTAS (comandos de status) ---
         cmd_norm = _normalizar(comando)
@@ -1626,15 +1818,13 @@ class SiriusCerebro:
             if not _nao_estudavel:
                 self.memoria.adicionar_duvida(comando)
                 if self._agentes:
-                    threading.Thread(
-                        target=self._agentes.pesquisar_e_aprender,
-                        args=(comando,),
-                        daemon=True
-                    ).start()
+                    _tema = comando
+                    self.tarefa_background(
+                        fn=lambda: self._agentes.pesquisar_e_aprender(_tema),
+                        nome=f"Pesquisa: {_tema[:30]}"
+                    )
             resposta_final = (
-                "Mano, ainda nao sei responder isso bem. "
-                "Ja anotei e vou pesquisar mais sobre isso. "
-                "Me faz essa pergunta de novo daqui a pouco!"
+                "Não tenho essa informação ainda. Já anotei para pesquisar."
             )
 
         self._adicionar_contexto("assistant", resposta_final)
