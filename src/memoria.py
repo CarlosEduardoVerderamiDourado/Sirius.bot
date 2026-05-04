@@ -1,19 +1,24 @@
 """
-memoria.py — Memória persistente do Sirius
+memoria.py — Memória persistente do Sirius com suporte a múltiplos usuários
 
 Otimizações aplicadas:
   - WAL mode (Write-Ahead Logging): escritas não bloqueiam leituras
   - Conexão persistente por banco: abre uma vez, reutiliza sempre
   - PRAGMAs de performance: synchronous=NORMAL, cache_size=2000
-  - Cache LRU do histórico em RAM: evita SQLite para leituras frequentes
+  - Cache LRU do histórico em RAM segregado por user_id
   - Fila de escrita assíncrona: salvar_historico() retorna imediatamente
-  - Batch insert: agrupa múltiplas inserções quando possível
+  - Índices otimizados para queries por user_id e tema
+  - Prepared statements para segurança contra SQL injection
+  - Thread-safe com locks para operações críticas
 """
 
 import sqlite3
 import os
 import threading
 import queue
+import uuid
+import re
+from datetime import datetime, timedelta
 from collections import deque
 from functools import lru_cache
 
@@ -39,9 +44,12 @@ class SiriusMemory:
         self._lock_p = threading.Lock()
         self._lock_t = threading.Lock()
 
-        # Cache do histórico em RAM — evita SQLite para contexto de sessão
-        self._cache_historico: deque = deque(maxlen=50)
-        self._cache_valido = False
+        # Cache do histórico em RAM segregado por user_id — evita SQLite para leituras frequentes
+        self._cache_historico: dict = {}  # user_id -> deque(maxlen=50)
+        self._cache_valido: dict = {}      # user_id -> bool
+        self._lock_cache = threading.Lock()
+        self.user_id: str = ""
+        self.session_id: str = ""
 
         # Fila de escrita assíncrona — retorna imediatamente, escreve em bg
         self._fila_escrita: queue.Queue = queue.Queue()
@@ -86,50 +94,131 @@ class SiriusMemory:
     # -----------------------------------------------------------------------
 
     def inicializar_bancos(self):
+        """Inicializa bancos de dados com suporte a múltiplos usuários.
+        Executa migração automática em bancos existentes sem erros.
+        """
         with self._lock_p:
             conn = self._conn_pessoal()
+            
+            # ===== MIGRAÇÃO AUTOMÁTICA PARA BANCOS EXISTENTES =====
+            try:
+                conn.execute("ALTER TABLE conversas ADD COLUMN user_id TEXT DEFAULT 'admin'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Coluna já existe
+            
+            try:
+                conn.execute("ALTER TABLE estado_app ADD COLUMN user_id TEXT DEFAULT 'admin'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            
+            # ===== CRIAÇÃO DE TABELAS OTIMIZADAS PARA MULTI-USUÁRIO =====
             conn.executescript("""
+                -- Histórico de conversas com suporte a múltiplos usuários
                 CREATE TABLE IF NOT EXISTS conversas (
                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                    role      TEXT,
+                    user_id   TEXT NOT NULL DEFAULT 'admin',
+                    role      TEXT NOT NULL,
                     content   TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    sessao    TEXT
+                    sessao    TEXT,
+                    session_id TEXT DEFAULT ''
                 );
+                
+                -- Índices para performance com user_id
+                CREATE INDEX IF NOT EXISTS idx_conversas_user_id ON conversas(user_id);
+                CREATE INDEX IF NOT EXISTS idx_conversas_user_session ON conversas(user_id, session_id);
+                CREATE INDEX IF NOT EXISTS idx_conversas_role ON conversas(role);
+                CREATE INDEX IF NOT EXISTS idx_conversas_timestamp ON conversas(timestamp DESC);
+                
+                -- Macros do sistema
                 CREATE TABLE IF NOT EXISTS macros (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome       TEXT UNIQUE,
+                    nome       TEXT UNIQUE NOT NULL,
                     comandos   TEXT,
                     criado_em  DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
+                
+                -- Dúvidas do sistema
                 CREATE TABLE IF NOT EXISTS duvidas (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pergunta     TEXT UNIQUE,
+                    pergunta     TEXT UNIQUE NOT NULL,
                     status       TEXT DEFAULT 'pendente',
                     data_criacao DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_conversas_role ON conversas(role);
-                CREATE INDEX IF NOT EXISTS idx_duvidas_status  ON duvidas(status);
+                CREATE INDEX IF NOT EXISTS idx_duvidas_status ON duvidas(status);
+                
+                -- Estado persistente do app segregado por usuário
+                CREATE TABLE IF NOT EXISTS estado_app (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL DEFAULT 'admin',
+                    chave      TEXT NOT NULL,
+                    valor      TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, chave)
+                );
+                CREATE INDEX IF NOT EXISTS idx_estado_user_chave ON estado_app(user_id, chave);
+                
+                -- Sessões autenticadas de usuários
+                CREATE TABLE IF NOT EXISTS sessoes (
+                    token         TEXT PRIMARY KEY,
+                    user_id       TEXT NOT NULL,
+                    nome          TEXT,
+                    criado_em     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ultimo_acesso DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expira_em     DATETIME
+                );
+                CREATE INDEX IF NOT EXISTS idx_sessoes_user_id ON sessoes(user_id);
+                CREATE INDEX IF NOT EXISTS idx_sessoes_expira ON sessoes(expira_em);
             """)
             conn.commit()
 
         with self._lock_t:
             conn = self._conn_treino()
+            
+            # Migração automática para banco de treino
+            try:
+                conn.execute("ALTER TABLE conhecimento_geral ADD COLUMN user_id TEXT DEFAULT 'admin'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            
+            try:
+                conn.execute("ALTER TABLE memoria_permanente ADD COLUMN user_id TEXT DEFAULT 'admin'")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+            
+            # ===== CRIAÇÃO DE TABELAS DE TREINO COM ISOLAMENTO POR USUÁRIO =====
             conn.executescript("""
+                -- Conhecimento geral aprendido pelo Sirius (segregado por user_id)
                 CREATE TABLE IF NOT EXISTS conhecimento_geral (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tema         TEXT,
-                    conteudo     TEXT,
-                    validado_por TEXT,
+                    user_id      TEXT NOT NULL DEFAULT 'admin',
+                    tema         TEXT NOT NULL,
+                    conteudo     TEXT NOT NULL,
+                    validado_por TEXT DEFAULT 'Sirius',
                     data_estudo  DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    tags         TEXT
+                    tags         TEXT DEFAULT 'geral'
                 );
+                
+                -- Índices para otimizar buscas por usuário e tema
+                CREATE INDEX IF NOT EXISTS idx_conhecimento_user_id ON conhecimento_geral(user_id);
+                CREATE INDEX IF NOT EXISTS idx_conhecimento_user_tema ON conhecimento_geral(user_id, tema);
+                CREATE INDEX IF NOT EXISTS idx_conhecimento_tema ON conhecimento_geral(tema);
+                CREATE INDEX IF NOT EXISTS idx_conhecimento_tags ON conhecimento_geral(tags);
+                
+                -- Memória permanente (reforços e correlações)
                 CREATE TABLE IF NOT EXISTS memoria_permanente (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                    conteudo TEXT,
-                    tema     TEXT
+                    user_id  TEXT NOT NULL DEFAULT 'admin',
+                    conteudo TEXT NOT NULL,
+                    tema     TEXT NOT NULL,
+                    criado_em DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_conhecimento_tema ON conhecimento_geral(tema);
+                CREATE INDEX IF NOT EXISTS idx_memoria_user_id ON memoria_permanente(user_id);
+                CREATE INDEX IF NOT EXISTS idx_memoria_user_tema ON memoria_permanente(user_id, tema);
             """)
             conn.commit()
 
@@ -158,112 +247,208 @@ class SiriusMemory:
         """Envia operação de escrita para a fila assíncrona."""
         self._fila_escrita.put((fn, args))
 
-    def _make_writer(self, sql: str, params: tuple = (), banco: str = 'p',
-                     tag: str = "") -> callable:
-        """
-        Factory de funções de escrita assíncrona.
-
-        Elimina o padrão repetitivo de definir _write() dentro de cada método:
-          ANTES (40 linhas de boilerplate para 4 métodos):
-            def adicionar_duvida(self, pergunta):
-                def _write():
-                    try:
-                        with self._lock_p:
-                            conn = self._conn_pessoal()
-                            conn.execute(SQL, (pergunta,))
-                            conn.commit()
-                    except Exception as e: print(...)
-                self._async(_write)
-
-          DEPOIS (1 linha por método):
-            def adicionar_duvida(self, pergunta):
-                self._async(self._make_writer(SQL, (pergunta,)))
-
-        Parâmetros:
-          sql:    SQL a executar
-          params: tupla de parâmetros para o SQL
-          banco:  'p' = pessoal (padrão)  |  't' = treino
-          tag:    prefixo para mensagem de erro (opcional)
-
-        Retorna:
-          Callable () → None  que executa sql com params no banco correto.
-        """
-        if banco == 't':
-            get_conn = self._conn_treino
-            lock     = self._lock_t
-        else:
-            get_conn = self._conn_pessoal
-            lock     = self._lock_p
-
-        def _writer():
+    def _exec_async_pessoal(self, sql: str, params: tuple = ()):
+        """Factory de escrita assíncrona no banco pessoal."""
+        def _write():
             try:
-                with lock:
-                    conn = get_conn()
+                with self._lock_p:
+                    conn = self._conn_pessoal()
                     conn.execute(sql, params)
                     conn.commit()
             except Exception as e:
-                prefixo = f"[MEMORIA{f'/{tag}' if tag else ''}]"
-                print(f"{prefixo}: Erro ao escrever: {e}")
+                print(f"[MEMORIA]: Erro na escrita: {e}")
+        self._async(_write)
 
-        return _writer
+    def _exec_async_treino(self, sql: str, params: tuple = ()):
+        """Factory de escrita assíncrona no banco de treino."""
+        def _write():
+            try:
+                with self._lock_t:
+                    conn = self._conn_treino()
+                    conn.execute(sql, params)
+                    conn.commit()
+            except Exception as e:
+                print(f"[MEMORIA]: Erro na escrita (treino): {e}")
+        self._async(_write)
+
+    def _user_id_val(self) -> str:
+        """Retorna o user_id atual ou 'admin' como padrão."""
+        return (self.user_id or "admin").strip()
+
+    def definir_usuario(self, user_id: str, session_id: str | None = None):
+        """Define qual usuário e sessão atual esta instância deve usar."""
+        user_id = (user_id or "admin").strip()
+        session_id = (session_id or "").strip()
+        # Limpa cache anterior quando muda de usuário
+        if self.user_id != user_id:
+            with self._lock_cache:
+                if self.user_id in self._cache_valido:
+                    self._cache_valido[self.user_id] = False
+        self.user_id = user_id
+        self.session_id = session_id
+
+    def _now_iso(self) -> str:
+        """Retorna timestamp ISO atual."""
+        return datetime.now().isoformat(sep=" ", timespec="seconds")
 
     # -----------------------------------------------------------------------
-    # Histórico — com cache em RAM
+    # Gerenciamento de Sessões
     # -----------------------------------------------------------------------
 
-    def obter_historico_db(self, limit: int = 15):
-        """
-        Retorna as últimas conversas em ordem cronológica.
-        Usa cache em RAM para as últimas 50 — só vai ao SQLite se necessário.
-        """
-        if self._cache_valido and len(self._cache_historico) >= min(limit, len(self._cache_historico)):
-            items = list(self._cache_historico)
-            return items[-limit:] if len(items) > limit else items
-
-        try:
-            with self._lock_p:
-                conn   = self._conn_pessoal()
-                cursor = conn.execute(
-                    "SELECT role, content FROM conversas ORDER BY id DESC LIMIT ?",
-                    (max(limit, 50),)
-                )
-                linhas = cursor.fetchall()
-
-            historico = [(r, c) for r, c in reversed(linhas)]
-            self._cache_historico = deque(historico, maxlen=50)
-            self._cache_valido    = True
-            return historico[-limit:] if len(historico) > limit else historico
-        except Exception as e:
-            print(f"[MEMORIA]: Falha ao obter histórico: {e}")
-            return []
-
-    def _salvar_historico_sync(self, pergunta: str, resposta: str):
-        """Escrita real no banco — chamada pelo worker assíncrono."""
+    def criar_sessao(self, user_id: str, nome: str, duracao_segundos: int = 86400) -> dict:
+        """Cria uma nova sessão de usuário com token único."""
+        token = str(uuid.uuid4())
+        agora = datetime.now()
+        expira = agora + timedelta(seconds=duracao_segundos)
         try:
             with self._lock_p:
                 conn = self._conn_pessoal()
                 conn.execute(
-                    "INSERT INTO conversas (role, content, sessao) VALUES (?, ?, ?)",
-                    ("user", pergunta, "geral")
-                )
-                conn.execute(
-                    "INSERT INTO conversas (role, content, sessao) VALUES (?, ?, ?)",
-                    ("assistant", resposta, "geral")
+                    "INSERT OR REPLACE INTO sessoes (token, user_id, nome, criado_em, ultimo_acesso, expira_em) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (token, user_id, nome, agora.isoformat(), agora.isoformat(), expira.isoformat())
                 )
                 conn.commit()
-            # Invalida cache
-            self._cache_valido = False
+            return {
+                "token": token,
+                "user_id": user_id,
+                "nome": nome,
+                "expira_em": expira.isoformat(),
+            }
         except Exception as e:
-            print(f"[MEMORIA]: Erro ao salvar histórico: {e}")
+            print(f"[MEMORIA]: Erro ao criar sessão: {e}")
+            return {}
+
+    def validar_sessao(self, token: str) -> dict | None:
+        """Valida e atualiza uma sessão existente."""
+        try:
+            with self._lock_p:
+                conn = self._conn_pessoal()
+                row = conn.execute(
+                    "SELECT user_id, nome, criado_em, ultimo_acesso, expira_em FROM sessoes WHERE token = ?",
+                    (token,)
+                ).fetchone()
+                if not row:
+                    return None
+                user_id, nome, criado_em, ultimo_acesso, expira_em = row
+                if expira_em and datetime.fromisoformat(expira_em) < datetime.now():
+                    conn.execute("DELETE FROM sessoes WHERE token = ?", (token,))
+                    conn.commit()
+                    return None
+                ultimo = datetime.now().isoformat()
+                conn.execute(
+                    "UPDATE sessoes SET ultimo_acesso = ? WHERE token = ?",
+                    (ultimo, token)
+                )
+                conn.commit()
+            return {
+                "token": token,
+                "user_id": user_id,
+                "nome": nome,
+                "criado_em": criado_em,
+                "ultimo_acesso": ultimo,
+                "expira_em": expira_em,
+            }
+        except Exception as e:
+            print(f"[MEMORIA]: Erro ao validar sessão: {e}")
+            return None
+
+    def revogar_sessao(self, token: str) -> bool:
+        """Revoga uma sessão existente."""
+        try:
+            with self._lock_p:
+                conn = self._conn_pessoal()
+                conn.execute("DELETE FROM sessoes WHERE token = ?", (token,))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[MEMORIA]: Erro ao revogar sessão: {e}")
+            return False
+
+    # -----------------------------------------------------------------------
+    # Histórico de Conversas (Isolado por user_id)
+    # -----------------------------------------------------------------------
+
+    def obter_historico_db(self, limit: int = 15):
+        """Retorna as últimas conversas em ordem cronológica do usuário atual.
+        Usa cache em RAM segregado por user_id para as últimas 50.
+        Thread-safe: protege acesso ao cache com lock.
+        """
+        user_id = self._user_id_val()
+        
+        with self._lock_cache:
+            # Verifica cache válido para este usuário
+            if self._cache_valido.get(user_id, False) and user_id in self._cache_historico:
+                cache = self._cache_historico[user_id]
+                if len(cache) >= min(limit, len(cache)):
+                    items = list(cache)
+                    return items[-limit:] if len(items) > limit else items
+
+        try:
+            with self._lock_p:
+                conn = self._conn_pessoal()
+                cursor = conn.execute(
+                    "SELECT role, content FROM conversas WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                    (user_id, max(limit, 50))
+                )
+                linhas = cursor.fetchall()
+
+            historico = [(r, c) for r, c in reversed(linhas)]
+            
+            # Atualiza cache segregado por user_id com thread-safety
+            with self._lock_cache:
+                self._cache_historico[user_id] = deque(historico, maxlen=50)
+                self._cache_valido[user_id] = True
+            
+            return historico[-limit:] if len(historico) > limit else historico
+        except Exception as e:
+            print(f"[MEMORIA]: Falha ao obter histórico para user_id={user_id}: {e}")
+            return []
+
+    def _salvar_historico_sync(self, pergunta: str, resposta: str):
+        """Escrita real no banco — chamada pelo worker assíncrono.
+        Usa prepared statements com ? para segurança contra SQL injection.
+        """
+        user_id = self._user_id_val()
+        try:
+            with self._lock_p:
+                conn = self._conn_pessoal()
+                agora = self._now_iso()
+                
+                # Insert pergunta do usuário
+                conn.execute(
+                    "INSERT INTO conversas (user_id, role, content, sessao, session_id, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, "user", pergunta, self.session_id or "default", self.session_id or "", agora)
+                )
+                # Insert resposta do assistente
+                conn.execute(
+                    "INSERT INTO conversas (user_id, role, content, sessao, session_id, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, "assistant", resposta, self.session_id or "default", self.session_id or "", agora)
+                )
+                conn.commit()
+            
+            # Invalida cache para este usuário
+            with self._lock_cache:
+                self._cache_valido[user_id] = False
+        except Exception as e:
+            print(f"[MEMORIA]: Erro ao salvar histórico para user_id={user_id}: {e}")
 
     def salvar_historico(self, pergunta: str, resposta: str):
+        """Salva par pergunta/resposta de forma assíncrona e thread-safe.
+        Atualiza o cache em RAM imediatamente segregado por user_id.
+        Escreve no SQLite em background pela fila assíncrona.
         """
-        Salva par pergunta/resposta.
-        Atualiza o cache em RAM imediatamente e escreve no SQLite em background.
-        """
-        # Atualiza cache instantaneamente
-        self._cache_historico.append(("user",      pergunta))
-        self._cache_historico.append(("assistant", resposta))
+        user_id = self._user_id_val()
+        
+        # Atualiza cache instantaneamente de forma thread-safe
+        with self._lock_cache:
+            if user_id not in self._cache_historico:
+                self._cache_historico[user_id] = deque(maxlen=50)
+            self._cache_historico[user_id].append(("user", pergunta))
+            self._cache_historico[user_id].append(("assistant", resposta))
+        
         # Escreve no banco de forma assíncrona
         self._async(self._salvar_historico_sync, pergunta, resposta)
 
@@ -272,17 +457,25 @@ class SiriusMemory:
     # -----------------------------------------------------------------------
 
     def adicionar_duvida(self, pergunta: str) -> bool:
-        self._async(self._make_writer(
-            "INSERT OR IGNORE INTO duvidas (pergunta) VALUES (?)",
-            (pergunta.strip(),), tag="duvida"
-        ))
+        def _write():
+            try:
+                with self._lock_p:
+                    conn = self._conn_pessoal()
+                    conn.execute(
+                        "INSERT OR IGNORE INTO duvidas (pergunta) VALUES (?)",
+                        (pergunta.strip(),)
+                    )
+                    conn.commit()
+            except Exception as e:
+                print(f"[MEMORIA]: Erro ao adicionar dúvida: {e}")
+        self._async(_write)
         return True
 
     def buscar_duvida_pendente(self) -> str | None:
         try:
             with self._lock_p:
                 conn = self._conn_pessoal()
-                r    = conn.execute(
+                r = conn.execute(
                     "SELECT pergunta FROM duvidas WHERE status='pendente' ORDER BY id ASC LIMIT 1"
                 ).fetchone()
             return r[0] if r else None
@@ -290,25 +483,186 @@ class SiriusMemory:
             return None
 
     def marcar_duvida_como_resolvida(self, pergunta: str):
-        self._async(self._make_writer(
-            "DELETE FROM duvidas WHERE pergunta=?",
-            (pergunta,), tag="duvida_del"
-        ))
+        def _write():
+            try:
+                with self._lock_p:
+                    conn = self._conn_pessoal()
+                    conn.execute("DELETE FROM duvidas WHERE pergunta=?", (pergunta,))
+                    conn.commit()
+            except Exception:
+                pass
+        self._async(_write)
 
     # -----------------------------------------------------------------------
-    # Treino / conhecimento
+    # Treino / Conhecimento (Isolado por user_id)
     # -----------------------------------------------------------------------
 
-    def salvar_estudo_autonomo(self, tema: str, conteudo: str, tags: str = "geral") -> bool:
-        self._async(self._make_writer(
-            "INSERT INTO conhecimento_geral (tema, conteudo, validado_por, tags) VALUES (?,?,?,?)",
-            (tema.lower().strip(), conteudo, "Sirius", tags),
-            banco='t', tag="estudo"
-        ))
+    def _validar_user_id(self, user_id: str) -> bool:
+        """Valida se o user_id segue o padrão seguro: alphanumério, hífen e underline."""
+        if not user_id:
+            return False
+        return bool(re.match(r'^[a-zA-Z0-9_-]{1,64}$', user_id))
+
+    def salvar_estudo_autonomo(self, tema: str, conteudo: str, tags: str = "geral", user_id: str = None) -> bool:
+        """Salva aprendizado autônomo vinculado a um usuário específico.
+        Thread-safe com prepared statements e validação de user_id.
+        """
+        user_id = (user_id or self.user_id or "admin").strip()
+        
+        # Validar user_id
+        if not self._validar_user_id(user_id):
+            print(f"[MEMORIA]: user_id inválido: {user_id}")
+            return False
+        
+        tema_limpo = tema.lower().strip()
+        conteudo_limpo = conteudo.strip()
+        tags_limpo = (tags or "geral").strip()
+        
+        if not tema_limpo or not conteudo_limpo:
+            print(f"[MEMORIA]: Tema ou conteúdo vazio")
+            return False
+        
+        def _write():
+            try:
+                with self._lock_t:
+                    conn = self._conn_treino()
+                    conn.execute(
+                        "INSERT INTO conhecimento_geral (user_id, tema, conteudo, validado_por, tags, data_estudo) "
+                        "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        (user_id, tema_limpo, conteudo_limpo, "Sirius", tags_limpo)
+                    )
+                    conn.commit()
+                print(f"[MEMORIA]: Estudo autônomo salvo para user_id={user_id}, tema={tema_limpo}")
+            except Exception as e:
+                print(f"[MEMORIA]: Erro ao salvar estudo para user_id={user_id}: {e}")
+        
+        self._async(_write)
         return True
 
-    def salvar_amostra_treino(self, tema: str, conteudo: str) -> bool:
-        return self.salvar_estudo_autonomo(tema, conteudo, tags="reforco_manual")
+    def salvar_amostra_treino(self, tema: str, conteudo: str, user_id: str = None) -> bool:
+        """Salva amostra de treino com tag de reforço manual."""
+        return self.salvar_estudo_autonomo(tema, conteudo, tags="reforco_manual", user_id=user_id)
+    
+    def obter_conhecimento(self, tema: str = None, user_id: str = None, limit: int = 10) -> list:
+        """Recupera conhecimento salvo para um usuário e tema específicos.
+        Thread-safe com prepared statements.
+        Returns: Lista de tuplas (tema, conteudo, validado_por, data_estudo)
+        """
+        user_id = (user_id or self.user_id or "admin").strip()
+        tema_filtro = (tema or "").lower().strip()
+        
+        try:
+            with self._lock_t:
+                conn = self._conn_treino()
+                if tema_filtro:
+                    rows = conn.execute(
+                        "SELECT tema, conteudo, validado_por, data_estudo FROM conhecimento_geral "
+                        "WHERE user_id = ? AND tema = ? ORDER BY data_estudo DESC LIMIT ?",
+                        (user_id, tema_filtro, limit)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT tema, conteudo, validado_por, data_estudo FROM conhecimento_geral "
+                        "WHERE user_id = ? ORDER BY data_estudo DESC LIMIT ?",
+                        (user_id, limit)
+                    ).fetchall()
+            return rows if rows else []
+        except Exception as e:
+            print(f"[MEMORIA]: Erro ao obter conhecimento para user_id={user_id}: {e}")
+            return []
+    
+    def salvar_memoria_permanente(self, conteudo: str, tema: str = "geral", user_id: str = None) -> bool:
+        """Salva memória permanente (correlações, reforços) para um usuário.
+        Thread-safe com prepared statements.
+        """
+        user_id = (user_id or self.user_id or "admin").strip()
+        
+        if not self._validar_user_id(user_id):
+            print(f"[MEMORIA]: user_id inválido: {user_id}")
+            return False
+        
+        conteudo_limpo = conteudo.strip()
+        tema_limpo = (tema or "geral").lower().strip()
+        
+        if not conteudo_limpo:
+            return False
+        
+        def _write():
+            try:
+                with self._lock_t:
+                    conn = self._conn_treino()
+                    conn.execute(
+                        "INSERT INTO memoria_permanente (user_id, conteudo, tema, criado_em) "
+                        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                        (user_id, conteudo_limpo, tema_limpo)
+                    )
+                    conn.commit()
+            except Exception as e:
+                print(f"[MEMORIA]: Erro ao salvar memória permanente para user_id={user_id}: {e}")
+        
+        self._async(_write)
+        return True
+
+    # -----------------------------------------------------------------------
+    # Estado do App (Isolado por user_id)
+    # -----------------------------------------------------------------------
+
+    def salvar_estado(self, chave: str, valor: str) -> bool:
+        """Persiste qualquer estado do app no banco pessoal, segregado por user_id.
+        Usa UPSERT — cria ou atualiza a chave.
+        Thread-safe com prepared statements.
+        """
+        chave_limpa = chave.strip()
+        valor_str = str(valor)
+        user_id = self._user_id_val()
+        
+        self._exec_async_pessoal(
+            "INSERT INTO estado_app (user_id, chave, valor, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id, chave) DO UPDATE SET "
+            "    valor      = excluded.valor, "
+            "    updated_at = CURRENT_TIMESTAMP",
+            (user_id, chave_limpa, valor_str)
+        )
+        return True
+
+    def carregar_estado(self, chave: str, padrao: str = None) -> str | None:
+        """Lê um valor de estado salvo, filtrado por user_id atual.
+        Retorna padrao se a chave não existir.
+        Thread-safe com prepared statements.
+        """
+        try:
+            user_id = self._user_id_val()
+            chave_limpa = chave.strip()
+            
+            with self._lock_p:
+                conn = self._conn_pessoal()
+                r = conn.execute(
+                    "SELECT valor FROM estado_app WHERE user_id = ? AND chave = ?",
+                    (user_id, chave_limpa)
+                ).fetchone()
+            return r[0] if r else padrao
+        except Exception as e:
+            print(f"[MEMORIA]: Erro ao carregar estado '{chave}' para user_id={self._user_id_val()}: {e}")
+            return padrao
+
+    def carregar_todos_estados(self) -> dict:
+        """Retorna todos os estados salvos como dicionário, filtrado por user_id atual.
+        Thread-safe com prepared statements.
+        """
+        try:
+            user_id = self._user_id_val()
+            
+            with self._lock_p:
+                conn = self._conn_pessoal()
+                rows = conn.execute(
+                    "SELECT chave, valor FROM estado_app WHERE user_id = ?",
+                    (user_id,)
+                ).fetchall()
+            return {r[0]: r[1] for r in rows}
+        except Exception as e:
+            print(f"[MEMORIA]: Erro ao carregar estados para user_id={self._user_id_val()}: {e}")
+            return {}
 
     # -----------------------------------------------------------------------
     # Macros
@@ -318,7 +672,7 @@ class SiriusMemory:
         try:
             with self._lock_p:
                 conn = self._conn_pessoal()
-                r    = conn.execute(
+                r = conn.execute(
                     "SELECT comandos FROM macros WHERE nome=?",
                     (nome.lower().strip(),)
                 ).fetchone()
@@ -327,8 +681,16 @@ class SiriusMemory:
             return None
 
     def salvar_macro(self, nome: str, comandos: str) -> bool:
-        self._async(self._make_writer(
-            "INSERT OR REPLACE INTO macros (nome, comandos) VALUES (?,?)",
-            (nome.lower().strip(), comandos.strip()), tag="macro"
-        ))
+        def _write():
+            try:
+                with self._lock_p:
+                    conn = self._conn_pessoal()
+                    conn.execute(
+                        "INSERT OR REPLACE INTO macros (nome, comandos) VALUES (?,?)",
+                        (nome.lower().strip(), comandos.strip())
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+        self._async(_write)
         return True

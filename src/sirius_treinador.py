@@ -94,11 +94,11 @@ class SiriusTreinador:
             print(f"\033[31m[TREINADOR]: ✗ Embeddings falharam: {e}\033[0m")
             return False
 
-    def treinar_classificador(self):
+    def treinar_classificador(self, user_id=None):
         print("\033[94m[TREINADOR]: → Treinando RedeSirius (classificador)...\033[0m")
         try:
             neuronio = self._get_neuronio()
-            neuronio.treinar()
+            neuronio.treinar(user_id=user_id)
             print("\033[92m[TREINADOR]: ✓ Classificador atualizado!\033[0m")
             return True
         except Exception as e:

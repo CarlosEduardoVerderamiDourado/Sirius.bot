@@ -14,10 +14,6 @@ import os
 import sys
 import argparse
 
-# Suprime o banner "pygame-ce X.X.X (SDL ...)" que aparece no log ao importar
-# qualquer módulo que dependa do pygame indiretamente (ex: sirius_tts.py)
-os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
-
 # ---------------------------------------------------------------------------
 # PATH — este arquivo está fora de src/, precisa apontar para lá
 # ---------------------------------------------------------------------------
@@ -45,24 +41,6 @@ def _curar_dlls():
         print(f"[AVISO]: DLL setup: {e}")
 
 _curar_dlls()
-
-
-# ---------------------------------------------------------------------------
-# DPI Awareness — deve ser setado ANTES do Qt inicializar qualquer janela.
-# Sem isso o Qt tenta setar sozinho e falha com "Acesso negado" se o processo
-# já tiver um contexto DPI (comum em Python 3.10+ no Windows).
-# ---------------------------------------------------------------------------
-def _configurar_dpi():
-    try:
-        import ctypes
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
-        # Idêntico ao que o Qt usaria — evita o conflito.
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
-    except Exception:
-        # Pode falhar se já foi setado (segunda chamada) — não é problema.
-        pass
-
-_configurar_dpi()
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +97,15 @@ def main():
         print("\033[94m[SIRIUS]: Dica — duplo clique na esfera ou Win+S para abrir o chat.\033[0m")
 
     app, janela = iniciar_wallpaper(cerebro=cerebro, modo=modo)
+
+    # Servidor REST + WebSocket em background
+    try:
+        from sirius_server import iniciar_servidor
+        iniciar_servidor(cerebro=cerebro, host="0.0.0.0", porta=5000, em_thread=True)
+    except ImportError:
+        print("[SIRIUS]: sirius_server.py não encontrado — pip install fastapi uvicorn")
+    except Exception as e:
+        print(f"[SIRIUS]: Servidor não iniciou: {e}")
 
     try:
         sys.exit(app.exec())

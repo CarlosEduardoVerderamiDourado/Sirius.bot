@@ -5,7 +5,7 @@ import base64
 import time
 import random
 
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 
 
 # ---------------------------------------------------------------------------
@@ -133,21 +133,18 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
       evitando o bug de duplo loop que trava o microfone.
     """
 
-    def __init__(self):
-        # Cria o cerebro UMA unica vez e injeta na interface
-        # Evita dupla inicializacao de agentes/scheduler/leitor
-        self.cerebro = SiriusCerebro()
+    def __init__(self, cerebro=None):
+        super().__init__()
+        self.cerebro = cerebro or SiriusCerebro()
         self.ativo   = True
-        super().__init__(cerebro=self.cerebro)  # injeta — nao cria novo
 
         self._iniciar_aprendizado_autonomo()
         self._iniciar_treinador_autonomo()
-        # Registra coordenador e treinador no scheduler apos inicializacao
-        self._registrar_subsistemas_no_scheduler()
 
         self.icone_sirius = self._obter_icone_sirius()
         self.setWindowIcon(self.icone_sirius)
         self._configurar_bandeja()
+        self._iniciar_servidor()
 
     # ------------------------------------------------------------------
     # Inicialização de subsistemas
@@ -188,7 +185,7 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
         threading.Thread(target=self._subconsciente.iniciar_estudos, daemon=True).start()
 
     def _iniciar_treinador_autonomo(self):
-        """Inicia o retreino periodico das redes neurais (a cada 2 horas)."""
+        """Inicia o retreino periódico das redes neurais (a cada 2 horas)."""
         if not _TREINADOR_DISPONIVEL:
             return
         try:
@@ -198,16 +195,24 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
         except Exception as e:
             print(f"[MAIN]: Falha ao iniciar SiriusTreinador: {e}")
 
-    def _registrar_subsistemas_no_scheduler(self):
-        """Conecta coordenador e treinador ao scheduler apos inicializacao."""
+    def _iniciar_servidor(self):
+        """
+        Inicia o servidor REST + WebSocket em thread daemon.
+        Acessível em http://SEU_IP:5000 de qualquer dispositivo na rede.
+        """
         try:
-            coordenador = getattr(self, '_coordenador', None)
-            treinador   = getattr(self, '_treinador', None)
-            if self.cerebro._scheduler and (coordenador or treinador):
-                self.cerebro._registrar_scheduler(coordenador, treinador)
-                print("[MAIN]: Scheduler conectado ao coordenador e treinador.")
+            from sirius_server import iniciar_servidor
+            iniciar_servidor(
+                cerebro=self.cerebro,
+                host="0.0.0.0",
+                porta=5000,
+                em_thread=True,   # não bloqueia a UI
+            )
+        except ImportError:
+            print("[MAIN]: sirius_server.py não encontrado — servidor desativado.")
+            print("        pip install fastapi uvicorn")
         except Exception as e:
-            print(f"[MAIN]: Falha ao registrar scheduler: {e}")
+            print(f"[MAIN]: Servidor não iniciou: {e}")
 
     # ------------------------------------------------------------------
     # Interface e bandeja
@@ -303,6 +308,36 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    sirius = SiriusAppPrincipal()
+
+    # Instancia o cerebro antecipadamente para ler o último modo
+    cerebro_temp = SiriusCerebro()
+
+    # Lê o último modo usado da memória
+    ultimo_modo = None
+    if hasattr(cerebro_temp, 'memoria') and cerebro_temp.memoria:
+        try:
+            ultimo_modo = cerebro_temp.memoria.carregar_estado("ultimo_modo")
+        except Exception:
+            pass
+
+    print(f"\033[94m[MAIN]: Último modo registrado: "
+          f"{ultimo_modo or 'nenhum (primeiro boot)'}\033[0m")
+
+    if ultimo_modo == "wallpaper":
+        # Último uso foi como wallpaper — lança sirius_wallpaper.py
+        print("\033[92m[MAIN]: Restaurando modo wallpaper...\033[0m")
+        import subprocess
+        wallpaper_path = os.path.join(diretorio_src, "sirius_wallpaper.py")
+        if os.path.exists(wallpaper_path):
+            subprocess.Popen(
+                [sys.executable, wallpaper_path],
+                cwd=diretorio_src
+            )
+            sys.exit(0)
+        else:
+            print("[MAIN]: sirius_wallpaper.py não encontrado — abrindo modo janela.")
+
+    # Modo janela normal (padrão ou fallback)
+    sirius = SiriusAppPrincipal(cerebro=cerebro_temp)
     sirius.show()
     sys.exit(app.exec())

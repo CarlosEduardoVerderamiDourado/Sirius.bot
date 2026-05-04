@@ -4,6 +4,7 @@ import random
 import threading
 import os
 import time
+import subprocess
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -480,7 +481,7 @@ class SiriusInterfaceMainWindow(QMainWindow):
         self.btn_teclado.setFont(QFont("Consolas", 9, QFont.Bold))
         self.btn_teclado.setCursor(Qt.PointingHandCursor)
         self.btn_teclado.setCheckable(True)
-        self.btn_teclado.setChecked(True)  # começa visível
+        self.btn_teclado.setChecked(True)
         self.btn_teclado.toggled.connect(self._toggle_teclado)
         self.btn_teclado.setStyleSheet(f"""
             QPushButton {{ background: rgba(93,226,255,0.06); color: {COR_AZUL_NEON};
@@ -489,6 +490,33 @@ class SiriusInterfaceMainWindow(QMainWindow):
             QPushButton:checked {{ background: rgba(93,226,255,0.06); }}
             QPushButton:!checked {{ color: {COR_CINZA}; border-color: {COR_CINZA};
                                     background: transparent; }}
+        """)
+
+        # Botão WALLPAPER — ativa/desativa modo papel de parede
+        self.btn_wallpaper = QPushButton("□  WALLPAPER")
+        self.btn_wallpaper.setFixedSize(130, 36)
+        self.btn_wallpaper.setFont(QFont("Consolas", 9, QFont.Bold))
+        self.btn_wallpaper.setCursor(Qt.PointingHandCursor)
+        self.btn_wallpaper.setCheckable(True)
+        self.btn_wallpaper.setChecked(False)
+        self.btn_wallpaper.toggled.connect(self._toggle_wallpaper)
+        self.btn_wallpaper.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {COR_CINZA};
+                border: 1px solid {COR_CINZA};
+                border-radius: 6px;
+                letter-spacing: 1px;
+            }}
+            QPushButton:hover {{
+                color: {COR_AZUL_NEON};
+                border-color: {COR_AZUL_NEON};
+            }}
+            QPushButton:checked {{
+                background: rgba(0,255,136,0.08);
+                color: {COR_VERDE};
+                border: 1px solid {COR_VERDE};
+            }}
         """)
 
         btn_limpar = QPushButton("LIMPAR")
@@ -501,10 +529,17 @@ class SiriusInterfaceMainWindow(QMainWindow):
                            border: 1px solid {COR_CINZA}; border-radius: 6px; }}
             QPushButton:hover {{ color: {COR_AZUL_NEON}; border-color: {COR_AZUL_NEON}; }}
         """)
+
         lc.addWidget(self.btn_teclado)
+        lc.addWidget(self.btn_wallpaper)
         lc.addStretch()
         lc.addWidget(btn_limpar)
         root.addWidget(linha_ctrl)
+
+        # Estado interno do modo wallpaper
+        self._proc_wallpaper = None
+        self._timer_fundo    = QTimer(self)
+        self._timer_fundo.timeout.connect(self._manter_no_fundo)
 
         self.painel_chat = PainelChat()
         self.painel_chat.setFixedHeight(280)
@@ -569,14 +604,102 @@ class SiriusInterfaceMainWindow(QMainWindow):
     def set_fala_view(self, v: bool): self._on_estado(ESTADO_FALANDO if v else ESTADO_STANDBY)
 
     def _toggle_teclado(self, visivel: bool):
-        """Mostra/esconde a linha de input (campo texto + botão ENVIAR)."""
+        """Mostra/esconde a linha de input."""
         self.painel_chat.input.setVisible(visivel)
         self.painel_chat.btn_enviar.setVisible(visivel)
-        # Ajusta altura do painel: com teclado 280, sem teclado 220
         self.painel_chat.setFixedHeight(280 if visivel else 210)
         self.btn_teclado.setText("⌨  TECLADO" if visivel else "⌨  OCULTO")
 
+    def _toggle_wallpaper(self, ativar: bool):
+        """
+        Ativa/desativa modo papel de parede.
+        Quando ativo: lança sirius_wallpaper.py como processo separado
+        e minimiza esta janela.
+        Quando inativo: encerra o processo do wallpaper.
+        """
+        if ativar:
+            self._lancar_wallpaper()
+        else:
+            self._encerrar_wallpaper()
+
+    def _lancar_wallpaper(self):
+        """Lança sirius_wallpaper.py em processo separado."""
+        # Encerra instância anterior se houver
+        self._encerrar_wallpaper()
+
+        # Localiza sirius_wallpaper.py no mesmo diretório (src/)
+        src_dir  = os.path.dirname(os.path.abspath(__file__))
+        wallpaper = os.path.join(src_dir, "sirius_wallpaper.py")
+
+        if not os.path.exists(wallpaper):
+            self.painel_chat.log_sistema(
+                f"✗ sirius_wallpaper.py não encontrado em {src_dir}"
+            )
+            self.btn_wallpaper.setChecked(False)
+            return
+
+        try:
+            self._proc_wallpaper = subprocess.Popen(
+                [sys.executable, wallpaper],
+                cwd=src_dir,
+            )
+            self.btn_wallpaper.setText("■  WALLPAPER")
+            self.painel_chat.log_sistema(
+                "◆ Modo wallpaper iniciado. "
+                "Duplo clique na esfera para abrir o chat."
+            )
+            print(f"\033[92m[INTERFACE]: sirius_wallpaper.py lançado "
+                  f"(pid={self._proc_wallpaper.pid}).\033[0m")
+
+            # Salva o modo na memória do cerebro
+            self._salvar_modo_memoria("wallpaper")
+
+            # Timer que monitora se o processo ainda está vivo
+            self._timer_fundo.start(3000)
+
+        except Exception as e:
+            self.painel_chat.log_sistema(f"✗ Erro ao iniciar wallpaper: {e}")
+            self.btn_wallpaper.setChecked(False)
+            self._proc_wallpaper = None
+
+    def _encerrar_wallpaper(self):
+        """Encerra o processo do wallpaper se estiver rodando."""
+        proc = getattr(self, '_proc_wallpaper', None)
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+                print("\033[93m[INTERFACE]: sirius_wallpaper.py encerrado.\033[0m")
+            except Exception:
+                proc.kill()
+        self._proc_wallpaper = None
+        self._salvar_modo_memoria("janela")
+
+    def _manter_no_fundo(self):
+        """
+        Timer 3s — verifica se o processo wallpaper ainda está rodando.
+        Se encerrou externamente, desativa o botão.
+        """
+        proc = getattr(self, '_proc_wallpaper', None)
+        if proc and proc.poll() is not None:
+            # Processo encerrou sozinho
+            self._proc_wallpaper = None
+            self._timer_fundo.stop()
+            self.btn_wallpaper.setChecked(False)
+            self.btn_wallpaper.setText("□  WALLPAPER")
+
+
+    def _salvar_modo_memoria(self, modo: str):
+        """Persiste o último modo usado na memória do cerebro."""
+        try:
+            if hasattr(self._cerebro, 'memoria') and self._cerebro.memoria:
+                self._cerebro.memoria.salvar_estado("ultimo_modo", modo)
+        except Exception:
+            pass
+
     def closeEvent(self, event):
+        self._timer_fundo.stop()
+        self._encerrar_wallpaper()
         self.worker.parar()
         event.accept()
 

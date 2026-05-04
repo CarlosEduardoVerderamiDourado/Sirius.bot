@@ -7,6 +7,7 @@ import sys
 import re
 import time
 import threading
+import json
 
 diretorio_src = os.path.dirname(os.path.abspath(__file__))
 if diretorio_src not in sys.path:
@@ -777,6 +778,56 @@ def _parsear_controle_pc(texto, control):
     return None
 
 
+def _validar_url_local(url: str) -> bool:
+    url = url.strip()
+    if not url or " " in url:
+        return False
+    if url.startswith(("http://", "https://")):
+        return True
+    if url.startswith("www.") and "." in url:
+        return True
+    if any(url.startswith(prefix) for prefix in ("file:", "javascript:", "data:")):
+        return False
+    return "." in url
+
+
+def _detectar_comando_local_json(comando: str) -> dict | None:
+    """Retorna JSON de comando local para ser enviado ao cliente de controle."""
+    t = _normalizar(comando)
+
+    if any(termo in t for termo in [
+        "abre o chrome", "abre chrome", "abrir chrome",
+        "abre o firefox", "abre firefox", "abrir firefox",
+        "abre o edge", "abre edge", "abrir edge",
+        "abre o navegador", "abre o browser", "abre o navegador padrao",
+    ]):
+        return {"tipo": "comando_local", "acao": "open_app", "alvo": "navegador"}
+
+    if any(termo in t for termo in [
+        "fecha o chrome", "fecha chrome", "fechar chrome",
+        "fecha o firefox", "fecha firefox", "fechar firefox",
+        "fecha o edge", "fecha edge", "fechar edge",
+        "fecha o navegador", "fechar o navegador", "fecha o browser",
+    ]):
+        return {"tipo": "comando_local", "acao": "close_app", "alvo": "navegador"}
+
+    if any(termo in t for termo in ["abre url", "abrir url", "abre o site", "abre o endereco"]):
+        url = comando.strip().split()[-1].strip().rstrip(".,;")
+        if _validar_url_local(url):
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            return {"tipo": "comando_local", "acao": "open_url", "alvo": url}
+        return None
+
+    match = re.search(r"abre(?:r)?\s+(?:o |a )?(?P<app>[\wçãõáéíóúâêô@.-]+)", t)
+    if match:
+        app = match.group("app").strip()
+        if app and app not in {"o", "a", "navegador", "browser", "google", "site", "url"}:
+            return {"tipo": "comando_local", "acao": "open_app", "alvo": app}
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1265,6 +1316,52 @@ class SiriusCerebro:
             return resposta
         return self._perfil.personalizar_resposta(resposta)
 
+    def _detectar_comando_demonstracao(self, comando: str):
+        """Detecta um comando para executar uma demonstração visual salva."""
+        try:
+            from sirius_autodidata import listar_demonstracoes_visuais, obter_demonstracao_visual
+        except Exception:
+            return None
+
+        usuario = self.memoria.user_id if hasattr(self, 'memoria') and self.memoria else 'guest'
+        t = _normalizar(comando)
+
+        if any(p in t for p in [
+            'listar demonstracoes', 'listar demonstrações', 'minhas demonstrações',
+            'meus demos', 'listar demos', 'mostrar demonstrações', 'quais demonstrações',
+            'minhas rotinas', 'minhas tarefas', 'listar rotinas', 'listar tarefas'
+        ]):
+            demos = listar_demonstracoes_visuais(usuario)
+            if not demos:
+                return 'Ainda não tenho demonstrações salvas para este usuário.'
+            nomes = ', '.join(d['nome'] for d in demos)
+            return f'Tenho as seguintes demonstrações salvas: {nomes}.'
+
+        match = re.search(
+            r'^(?:sirius,\s*)?(?:fa[çc]a|execute|executa|reproduz|reproduza|rode|rodar|segue|abre?)\s+(?:a\s+)?(?:demonstra[cç][aã]o\s+de\s+|demonstra[cç][aã]o\s+|tarefa\s+de\s+|rotina\s+de\s+|macro\s+de\s+)?(.+)$',
+            t,
+            re.IGNORECASE
+        )
+        if match:
+            nome = match.group(1).strip()
+            if not nome:
+                return None
+            demo = obter_demonstracao_visual(usuario, nome)
+            if demo:
+                sequencia = []
+                try:
+                    sequencia = json.loads(demo.get('sequencia_json') or '[]')
+                except Exception:
+                    sequencia = []
+                return {
+                    'tipo': 'comando_local',
+                    'acao': 'executar_demonstracao',
+                    'tarefa': demo.get('nome'),
+                    'descricao': demo.get('descricao', ''),
+                    'sequencia': sequencia,
+                }
+        return None
+
     def _processar_acao_simples(self, comando: str):
         """
         Processa um sub-comando simples sem entrar no loop de detecção paralela.
@@ -1439,7 +1536,7 @@ class SiriusCerebro:
                 callback_log=callback_log
             )
 
-    def processar(self, texto_usuario, forcar_processamento=False):
+    def processar(self, texto_usuario, forcar_processamento=False, executar_controle_localmente=False):
         if isinstance(texto_usuario, list):
             texto_usuario = texto_usuario[0] if texto_usuario else ""
         texto_lower = str(texto_usuario).lower().strip()
@@ -1756,6 +1853,23 @@ class SiriusCerebro:
 
         # --- Controle do PC (acao) ---
         if intencao == "acao":
+            if not executar_controle_localmente:
+                comando_demonstracao = self._detectar_comando_demonstracao(comando)
+                if comando_demonstracao:
+                    if isinstance(comando_demonstracao, dict):
+                        self._adicionar_contexto("assistant", "[COMANDO_LOCAL]")
+                        self.memoria.salvar_historico(comando, "[COMANDO_LOCAL]")
+                        self.memoria.salvar_amostra_treino(comando, "[COMANDO_LOCAL]")
+                        return comando_demonstracao
+                    return comando_demonstracao
+
+                comando_local = _detectar_comando_local_json(comando)
+                if comando_local:
+                    self._adicionar_contexto("assistant", "[COMANDO_LOCAL]")
+                    self.memoria.salvar_historico(comando, "[COMANDO_LOCAL]")
+                    self.memoria.salvar_amostra_treino(comando, "[COMANDO_LOCAL]")
+                    return comando_local
+
             resposta = _parsear_controle_pc(comando, self.control)
 
             # Intercepta tokens de confirmação — salva ação pendente

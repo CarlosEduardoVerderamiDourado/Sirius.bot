@@ -498,6 +498,62 @@ class SiriusVisao:
         except Exception as e:
             return f"Erro ao analisar região: {e}"
 
+    def identificar_botoes_em_imagem(self, imagem_path: str) -> dict:
+        """Detecta elementos de interface na imagem e retorna coordenadas candidatas."""
+        try:
+            from PIL import Image
+            import pytesseract
+            from pytesseract import Output
+
+            imagem = Image.open(imagem_path)
+            dados = pytesseract.image_to_data(
+                imagem,
+                lang="por+eng",
+                config="--psm 6 --oem 3",
+                output_type=Output.DICT
+            )
+
+            elementos = []
+            for i, texto in enumerate(dados.get("text", [])):
+                if not texto or len(texto.strip()) < 2:
+                    continue
+                try:
+                    conf = float(dados.get("conf", [])[i] or -1)
+                except Exception:
+                    conf = -1
+                if conf < 20:
+                    continue
+                x = int(dados.get("left", [])[i] or 0)
+                y = int(dados.get("top", [])[i] or 0)
+                largura = int(dados.get("width", [])[i] or 0)
+                altura = int(dados.get("height", [])[i] or 0)
+                if largura <= 0 or altura <= 0:
+                    continue
+                elementos.append({
+                    "texto": texto.strip(),
+                    "x": x,
+                    "y": y,
+                    "largura": largura,
+                    "altura": altura,
+                    "centro": [x + largura // 2, y + altura // 2],
+                    "conf": conf,
+                })
+
+            return {
+                "imagem": os.path.basename(imagem_path),
+                "largura": imagem.width,
+                "altura": imagem.height,
+                "elementos": elementos,
+            }
+        except Exception as e:
+            return {
+                "imagem": os.path.basename(imagem_path),
+                "largura": None,
+                "altura": None,
+                "elementos": [],
+                "erro": str(e),
+            }
+
     def esta_disponivel(self) -> bool:
         """Retorna True se pelo menos screenshot funciona."""
         try:

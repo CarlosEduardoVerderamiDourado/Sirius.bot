@@ -24,6 +24,124 @@ DB_TREINO    = os.path.join(CAMINHO_DATA, "sirius_treino.db")
 DB_PESSOAL   = os.path.join(CAMINHO_DATA, "sirius_pessoal.db")
 os.makedirs(CAMINHO_DATA, exist_ok=True)
 
+
+def _criar_tabela_demonstracoes_visuais():
+    conexao = sqlite3.connect(DB_PESSOAL)
+    conexao.execute("""
+        CREATE TABLE IF NOT EXISTS demonstracoes_visuais (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          TEXT DEFAULT '',
+            nome             TEXT,
+            descricao        TEXT,
+            sequencia_json   TEXT,
+            imagem_referencia TEXT,
+            criado_em        DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, nome)
+        );
+    """)
+    conexao.execute(
+        "CREATE INDEX IF NOT EXISTS idx_demonstracoes_visuais_usuario ON demonstracoes_visuais(user_id, nome);"
+    )
+    conexao.commit()
+    conexao.close()
+
+
+def salvar_demonstracao_visual(user_id: str, nome: str, descricao: str, sequencia_json: str, imagem_referencia: str = "") -> bool:
+    if not nome or not sequencia_json:
+        return False
+    user_id = (user_id or "guest").strip()
+    nome = nome.strip().lower()
+    descricao = descricao or ""
+    imagem_referencia = imagem_referencia or ""
+    try:
+        _criar_tabela_demonstracoes_visuais()
+        conexao = sqlite3.connect(DB_PESSOAL)
+        conexao.execute(
+            """
+            INSERT INTO demonstracoes_visuais
+                (user_id, nome, descricao, sequencia_json, imagem_referencia, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, nome) DO UPDATE SET
+                descricao = excluded.descricao,
+                sequencia_json = excluded.sequencia_json,
+                imagem_referencia = excluded.imagem_referencia,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, nome, descricao, sequencia_json, imagem_referencia)
+        )
+        conexao.commit()
+        return True
+    except Exception as e:
+        print(f"[AUTODIDATA]: Erro ao salvar demonstracao visual: {e}")
+        return False
+    finally:
+        try:
+            conexao.close()
+        except Exception:
+            pass
+
+
+def obter_demonstracao_visual(user_id: str, nome: str) -> dict | None:
+    if not nome:
+        return None
+    user_id = (user_id or "guest").strip()
+    nome = nome.strip().lower()
+    try:
+        _criar_tabela_demonstracoes_visuais()
+        conexao = sqlite3.connect(DB_PESSOAL)
+        cursor = conexao.execute(
+            "SELECT nome, descricao, sequencia_json, imagem_referencia, criado_em, updated_at"
+            " FROM demonstracoes_visuais"
+            " WHERE user_id = ? AND nome = ?",
+            (user_id, nome)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "nome": row[0],
+            "descricao": row[1],
+            "sequencia_json": row[2],
+            "imagem_referencia": row[3],
+            "criado_em": row[4],
+            "updated_at": row[5],
+        }
+    except Exception as e:
+        print(f"[AUTODIDATA]: Erro ao carregar demonstracao visual: {e}")
+        return None
+    finally:
+        try:
+            conexao.close()
+        except Exception:
+            pass
+
+
+def listar_demonstracoes_visuais(user_id: str) -> list[dict]:
+    user_id = (user_id or "guest").strip()
+    try:
+        _criar_tabela_demonstracoes_visuais()
+        conexao = sqlite3.connect(DB_PESSOAL)
+        cursor = conexao.execute(
+            "SELECT nome, descricao, imagem_referencia, criado_em, updated_at"
+            " FROM demonstracoes_visuais"
+            " WHERE user_id = ?",
+            (user_id,)
+        )
+        return [
+            {
+                "nome": row[0],
+                "descricao": row[1],
+                "imagem_referencia": row[2],
+                "criado_em": row[3],
+                "updated_at": row[4],
+            }
+            for row in cursor.fetchall()
+        ]
+    except Exception as e:
+        print(f"[AUTODIDATA]: Erro ao listar demonstracoes visuais: {e}")
+        return []
+
 # Headers padrao para todas as requisicoes — resolve problema do Wikipedia
 HEADERS_HTTP = {
     "User-Agent":      "SiriusBot/1.0 (Assistente educacional)",

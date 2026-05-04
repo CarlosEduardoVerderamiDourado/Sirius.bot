@@ -20,6 +20,22 @@ import time
 import threading
 import tempfile
 
+# ---------------------------------------------------------------------------
+# Silencia warnings do HuggingFace Hub e PyTorch antes de qualquer import
+# Deve ficar no topo — antes de "from kokoro import ..."
+# ---------------------------------------------------------------------------
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY",      "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS",  "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM",         "false")
+
+# Silencia loggers do HuggingFace Hub (warnings de autenticação e repo_id)
+# Os env vars acima não são suficientes — o hub loga antes de verificá-los.
+import logging as _logging
+for _n in ("huggingface_hub", "huggingface_hub.utils._headers",
+           "huggingface_hub.file_download"):
+    _logging.getLogger(_n).setLevel(_logging.ERROR)
+
 diretorio_src  = os.path.dirname(os.path.abspath(__file__))
 diretorio_raiz = os.path.dirname(diretorio_src)
 
@@ -57,10 +73,24 @@ class KokoroTTS:
     def _inicializar(self):
         try:
             import warnings
+            import os as _os
+
+            # Suprime warnings do HuggingFace Hub sobre autenticação e repo_id
+            # O modelo fica em cache local após o primeiro download —
+            # não precisa autenticar para uso offline.
+            _os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+            _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+            # Desativa telemetria e progresso do Hub (menos ruído no terminal)
+            _os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+            _os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 from kokoro import KPipeline
-                self._pipeline   = KPipeline(lang_code="p")
+                self._pipeline   = KPipeline(
+                    repo_id="hexgrad/Kokoro-82M",
+                    lang_code="p"
+                )
             self._voz        = self.VOZES_PTBR[0]
             self._disponivel = True
             print(f"\033[92m[TTS]: Kokoro carregado — voz '{self._voz}' ativa.\033[0m")
