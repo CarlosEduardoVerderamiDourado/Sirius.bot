@@ -283,6 +283,151 @@ def exemplo_fluxo_completo():
 
 
 # ==============================================================================
+# 5. INTEGRACAO COM SIRIUS_MAIL
+# ==============================================================================
+
+def exemplo_email_simples():
+    """Exemplo simples: buscar e-mails não lidos."""
+    from sirius_mail import SiriusEmailManager
+    
+    email_manager = SiriusEmailManager(user_id="carlos")
+    
+    # Conecta ao servidor IMAP
+    if email_manager.conectar():
+        # Lista últimos 3 e-mails não lidos
+        emails = email_manager.listar_nao_lidos(limite=3)
+        
+        print(f"\n[EMAIL]: {len(emails)} e-mail(s) encontrado(s)")
+        for i, email in enumerate(emails, 1):
+            print(f"\n  [{i}] De: {email['remetente']}")
+            print(f"      Assunto: {email['assunto']}")
+            print(f"      Resumo: {email['resumo']}")
+        
+        email_manager.desconectar()
+    else:
+        print("[EMAIL]: Não foi possível conectar. Verifique .env")
+
+
+def exemplo_email_com_prioridade():
+    """Exemplo: detectar prioridade de e-mails."""
+    from sirius_mail import SiriusEmailManager
+    
+    email_manager = SiriusEmailManager(user_id="carlos")
+    
+    if email_manager.conectar():
+        # Processa e-mails com análise de prioridade
+        resultado = email_manager.processar_emails()
+        
+        print(f"\n[EMAIL]: Resultado do processamento")
+        print(f"  Prioridade máxima: {resultado['prioridade_maxima']}")
+        print(f"  Requer interrupção: {resultado['requer_interrupcao']}")
+        print(f"  Mensagem: {resultado['mensagem_usuario']}")
+        
+        # Se tem e-mail urgente, mostra detalhes
+        if resultado['emails']:
+            print(f"\n  E-mails processados:")
+            for email in resultado['emails']:
+                print(f"    - {email['assunto']} [{email['prioridade']}]")
+        
+        email_manager.desconectar()
+
+
+def exemplo_langgraph_email():
+    """
+    Exemplo: Agente LangGraph que verifica e-mails periodicamente
+    e pode interromper o fluxo se encontrar algo urgente.
+    """
+    try:
+        from langgraph.graph import StateGraph, START, END
+        from typing_extensions import TypedDict
+    except ImportError:
+        print("pip install langgraph langchain-core")
+        return
+    
+    from sirius_mail import email_tool_factory
+    from memoria import SiriusMemory
+    
+    # ── State Definition ──────────────────────────────────────────────────
+    class EmailAgentState(TypedDict):
+        """State do agent de e-mail."""
+        user_id: str
+        emails: list
+        prioridade_maxima: str
+        requer_interrupcao: bool
+        acao_tomada: str
+    
+    # ── Inicializar ───────────────────────────────────────────────────────
+    memoria = SiriusMemory()
+    user_id = "carlos"
+    email_tool = email_tool_factory(memoria=memoria, user_id=user_id)
+    
+    # ── Nodes ─────────────────────────────────────────────────────────────
+    
+    def node_verificar_emails(state: EmailAgentState) -> EmailAgentState:
+        """Node que verifica e-mails não lidos."""
+        print("\n[GRAPH]: Verificando e-mails...")
+        
+        email_instance = email_tool["instance"]
+        resultado = email_instance.processar_emails()
+        
+        state["emails"] = resultado["emails"]
+        state["prioridade_maxima"] = resultado["prioridade_maxima"]
+        state["requer_interrupcao"] = resultado["requer_interrupcao"]
+        
+        return state
+    
+    def node_decidir_acao(state: EmailAgentState) -> EmailAgentState:
+        """Node que decide ação baseado em prioridade."""
+        print("\n[GRAPH]: Analisando prioridade...")
+        
+        if state["requer_interrupcao"]:
+            state["acao_tomada"] = "INTERROMPER_FLUXO"
+            print("[GRAPH]: E-mail urgente detectado! Interrompendo...")
+        else:
+            state["acao_tomada"] = "CONTINUAR"
+            print("[GRAPH]: Nenhum e-mail urgente. Continuando...")
+        
+        return state
+    
+    def node_notificar_usuario(state: EmailAgentState) -> EmailAgentState:
+        """Node que notifica usuário."""
+        print("\n[GRAPH]: Notificando usuário...")
+        
+        if state["emails"]:
+            print(f"[GRAPH]: {len(state['emails'])} e-mail(s) para revisar")
+        
+        return state
+    
+    # ── Build Graph ───────────────────────────────────────────────────────
+    graph = StateGraph(EmailAgentState)
+    
+    graph.add_node("verificar", node_verificar_emails)
+    graph.add_node("decidir", node_decidir_acao)
+    graph.add_node("notificar", node_notificar_usuario)
+    
+    graph.add_edge(START, "verificar")
+    graph.add_edge("verificar", "decidir")
+    graph.add_edge("decidir", "notificar")
+    graph.add_edge("notificar", END)
+    
+    # ── Run Agent ─────────────────────────────────────────────────────────
+    initial_state: EmailAgentState = {
+        "user_id": user_id,
+        "emails": [],
+        "prioridade_maxima": "nenhuma",
+        "requer_interrupcao": False,
+        "acao_tomada": ""
+    }
+    
+    print("\033[94m[GRAPH]: Iniciando agent de e-mail...\033[0m")
+    compiled_graph = graph.compile()
+    final_state = compiled_graph.invoke(initial_state)
+    
+    print("\n\033[92m[GRAPH]: Agent de e-mail terminou!\033[0m")
+    print(f"Ação tomada: {final_state['acao_tomada']}")
+
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
 
@@ -295,6 +440,9 @@ if __name__ == "__main__":
     print("[2] Exemplo Executor Simples")
     print("[3] Exemplo LangGraph Agent")
     print("[4] Fluxo Completo")
+    print("[5] Exemplo E-mail Simples")
+    print("[6] Exemplo E-mail com Prioridade")
+    print("[7] Exemplo LangGraph E-mail")
     
     try:
         # Executar todos os exemplos
@@ -321,6 +469,24 @@ if __name__ == "__main__":
             exemplo_fluxo_completo()
         except Exception as e:
             print(f"Erro: {e}")
+        
+        print("\n\n### RODANDO EXEMPLO 5: EMAIL SIMPLES ###")
+        try:
+            exemplo_email_simples()
+        except Exception as e:
+            print(f"Erro: {e}")
+        
+        print("\n\n### RODANDO EXEMPLO 6: EMAIL COM PRIORIDADE ###")
+        try:
+            exemplo_email_com_prioridade()
+        except Exception as e:
+            print(f"Erro: {e}")
+        
+        print("\n\n### RODANDO EXEMPLO 7: LANGGRAPH EMAIL ###")
+        try:
+            exemplo_langgraph_email()
+        except Exception as e:
+            print(f"Erro (LangGraph não instalado?): {e}")
         
     except KeyboardInterrupt:
         print("\n[INTERRUPTED]")
