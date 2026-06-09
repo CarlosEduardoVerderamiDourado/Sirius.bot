@@ -458,7 +458,7 @@ class SiriusCerebro:
         # O RAG é usado como CONTEXTO (injetado no sanduíche), não como resposta final.
         # Isso garante que as respostas saem no estilo Jarvis treinado.
         try:
-            resposta = await self._gerar_resposta(comando_enriquecido)
+            resposta = await self._gerar_resposta(comando_enriquecido, pergunta_pura=comando)
             if resposta:
                 print(f"\033[94m[CEREBRO]: Gerador retornou: {str(resposta)[:80]!r}\033[0m")
         except Exception as e:
@@ -653,15 +653,21 @@ class SiriusCerebro:
     # Auxiliares de geração e contexto
     # =========================================================================
 
-    async def _gerar_resposta(self, prompt: str) -> Optional[str]:
+    async def _gerar_resposta(self, prompt: str, pergunta_pura: str) -> Optional[str]:
         if self._gerador:
             try:
-                if asyncio.iscoroutinefunction(self._gerador.gerar):
-                    resultado = await self._gerador.gerar(prompt)
+                # Verifica se o gerador híbrido aceita o novo parâmetro de pergunta_pura
+                import inspect
+                if hasattr(self._gerador, "gerar"):
+                    sig = inspect.signature(self._gerador.gerar)
+                    if "pergunta_pura" in sig.parameters:
+                        resultado = self._gerador.gerar(prompt, pergunta_pura=pergunta_pura)
+                    else:
+                        resultado = self._gerador.gerar(prompt)
                 else:
-                    resultado = self._gerador.gerar(prompt)
+                    return None
 
-                # GeradorHibrido retorna (resposta, fonte); SiriusGerador retorna str
+                # GeradorHibrido retorna (resposta, fonte)
                 if isinstance(resultado, tuple):
                     resposta, fonte = resultado
                     if fonte != "sem resposta":

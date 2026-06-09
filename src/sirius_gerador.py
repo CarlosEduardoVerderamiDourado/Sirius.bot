@@ -234,22 +234,16 @@ class GeradorGemini:
         except Exception as e:
             logger.error(f"Erro ao inicializar Gemini: {e}")
     
-    def gerar(self, pergunta: str) -> Optional[str]:
-        """Gera resposta com Gemini"""
-        
+    def gerar(self, prompt_completo: str) -> Optional[str]:
+        """Gera resposta com Gemini recebendo o prompt já estruturado pelo cérebro"""
         if not self.disponivel:
             return None
         
         try:
-            prompt = f"""Você é o S.I.R.I.U.S., assistente prático e eficiente.
-Responda de forma concisa, sem contradições, uma resposta clara.
-
-Pergunta: {pergunta}
-
-Resposta:"""
-            
+            # Como o cérebro já monta o sanduíche com as tags [SYSTEM] e [HISTORICO],
+            # passamos o prompt direto para o Gemini respeitar as regras do projeto
             response = self.model.generate_content(
-                prompt,
+                prompt_completo,
                 generation_config=genai.types.GenerationConfig(
                     max_output_tokens=300,
                     temperature=0.7,
@@ -265,11 +259,11 @@ Resposta:"""
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GERADOR HÍBRIDO (DUPLA ENTREGA)
+# GERADOR HÍBRIDO (DUPLA ENTREGA CORRIGIDO)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GeradorHibrido:
-    """Dupla entrega: Gerador próprio + Gemini com fallback"""
+    """Dupla entrega: Gerador próprio + Gemini com fallback por falta de tokens"""
     
     def __init__(self):
         self.banco = BancoRespostasPropio()
@@ -277,62 +271,58 @@ class GeradorHibrido:
         self.gemini = GeradorGemini()
         self.validador = None
         
-        # Carregar validador como último fallback
         try:
             from validador_resposta import ValidadorCompleto
             self.validador = ValidadorCompleto()
         except:
             logger.warning("Validador não disponível")
     
-    def gerar(self, pergunta: str) -> Tuple[str, str]:
+    def gerar(self, prompt_enriquecido: str, pergunta_pura: Optional[str] = None) -> Tuple[str, str]:
         """
-        Gera resposta com Gemini como modelo principal.
-
-        Returns:
-            (resposta, fonte)
-            fonte: "gemini" | "banco" | "validador" | "sem resposta"
+        Gera resposta com Gemini como modelo principal e salva no aprendiz (banco).
         """
+        # Se não passar a pergunta pura separada, usa o começo do prompt (fallback)
+        pergunta_chave = pergunta_pura if pergunta_pura else prompt_enriquecido
 
         # PASSO 1: Gemini — principal (qualidade máxima)
         pode_usar_gemini, msg_tokens = self.monitor_tokens.pode_usar_gemini()
 
         if pode_usar_gemini and self.gemini.disponivel:
-            resposta_gemini = self.gemini.gerar(pergunta)
+            resposta_gemini = self.gemini.gerar(prompt_enriquecido)
 
             if resposta_gemini:
                 logger.info(f"🤖 Resposta do Gemini (principal): {resposta_gemini[:40]}...")
 
-                # Registrar uso de tokens
+                # Registrar uso de tokens no monitor
                 self.monitor_tokens.registrar(200, 0.001)
 
-                # CACHE: armazena no banco para uso offline futuro
+                # 🎓 APRENDIZADO: Armazena usando a PERGUNTA PURA do Carlos como chave de busca!
                 self.banco.armazenar_resposta(
-                    pergunta, resposta_gemini, fonte="gemini", qualidade=0.9
+                    pergunta_chave, resposta_gemini, fonte="gemini", qualidade=0.9
                 )
 
                 return resposta_gemini, "gemini"
         else:
-            logger.warning(f"⚠️ Gemini indisponível: {msg_tokens}")
+            logger.warning(f"⚠️ Gemini indisponível ou sem tokens: {msg_tokens}")
 
-        # PASSO 2: Banco próprio — cache offline (0 tokens)
-        resposta_banco = self.banco.obter_resposta(pergunta)
+        # PASSO 2: Aprendiz assume — Cache offline por falta de tokens (0 tokens)
+        resposta_banco = self.banco.obter_resposta(pergunta_chave)
         if resposta_banco:
-            logger.info(f"📚 Cache do banco (Gemini offline): {resposta_banco[:40]}...")
+            logger.info(f"📚 Aprendiz assumiu (Offline): {resposta_banco[:40]}...")
             return resposta_banco, "banco"
 
-        # PASSO 3: Validador como último fallback (offline)
+        # PASSO 3: Validador como último de todos os fallbacks
         if self.validador:
             try:
-                _, resposta_limpa, _, _ = self.validador.validar(pergunta, pergunta, 0.75)
-
-                if resposta_limpa and resposta_limpa != pergunta:
+                _, resposta_limpa, _, _ = self.validador.validar(pergunta_chave, pergunta_chave, 0.75)
+                if resposta_limpa and resposta_limpa != pergunta_chave:
                     logger.info(f"✔️ Fallback validador: {resposta_limpa[:40]}...")
                     return resposta_limpa, "validador"
             except Exception as e:
                 logger.error(f"Erro no validador: {e}")
 
         # PASSO 4: Sem resposta
-        logger.warning(f"⚠️ Nenhuma resposta para: {pergunta}")
+        logger.warning(f"⚠️ Nenhuma resposta para: {pergunta_chave[:30]}")
         return "Desculpe, não consegui processar. Reformule e tente novamente.", "sem resposta"
 
 # ═══════════════════════════════════════════════════════════════════════════════
