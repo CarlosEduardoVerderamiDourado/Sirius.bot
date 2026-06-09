@@ -34,14 +34,17 @@ aplicar_cura_sistema()
 # CORREÇÃO DE PATH
 # ---------------------------------------------------------------------------
 
-diretorio_atual = os.path.dirname(os.path.abspath(__file__))
-diretorio_src   = os.path.join(diretorio_atual, 'src')
+if getattr(sys, 'frozen', False):
+    # Rodando dentro do .exe
+    diretorio_atual = os.path.dirname(sys.executable)
+else:
+    # Rodando como script normal
+    diretorio_atual = os.path.dirname(os.path.abspath(__file__))
 
+diretorio_src = os.path.join(diretorio_atual, 'src')
 for p in [diretorio_atual, diretorio_src]:
     if os.path.exists(p) and p not in sys.path:
         sys.path.insert(0, p)
-
-
 # ---------------------------------------------------------------------------
 # IMPORTS PRINCIPAIS
 # ---------------------------------------------------------------------------
