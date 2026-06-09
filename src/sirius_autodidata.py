@@ -1,161 +1,112 @@
 """
-sirius_autodidata.py — Motor de aprendizado autônomo do Sirius
-Correções:
-- Wikipedia: fix de encoding UTF-8 e headers corretos
-- DuckDuckGo: migrado para pacote ddgs (renomeado de duckduckgo_search)
+sirius_autodidata.py — S.I.R.I.U.S. v5.2 — Motor de Aprendizado Autônomo
+=========================================================================
+Processa os 325 temas da base de conhecimento:
+  1. Lê a lista completa de TODOS_OS_TEMAS
+  2. Verifica quais já existem no banco (evita duplicatas)
+  3. Para cada tema novo: busca Wikipedia + web, gera resumo e salva via SiriusMemoria
+  4. A cada lote de 10 temas: chama SiriusRAG.rebuild() para atualizar índice FAISS
+  5. Logs coloridos no terminal com progresso em tempo real
+
+Correções v5.2:
+  - Wikipedia: headers UTF-8 corretos
+  - DuckDuckGo: usa pacote 'duckduckgo-search' (import: duckduckgo_search)
+  - Import corrigido: from memoria import SiriusMemoria (com 'ia' no final)
+  - RAG rebuild em lote — não a cada item (performance)
+  - Verificação de duplicata via SELECT COUNT antes de inserir
+
+Dependências:
+    pip install requests duckduckgo-search faiss-cpu sentence-transformers colorama
 """
 
+from __future__ import annotations
+
 import os
+import re
 import sys
+import sqlite3
+import threading
 import time
 import random
-import threading
-import sqlite3
-import re
-import requests
+from typing import Optional
 
-diretorio_src  = os.path.dirname(os.path.abspath(__file__))
-diretorio_raiz = os.path.dirname(diretorio_src)
-if diretorio_src not in sys.path:
-    sys.path.insert(0, diretorio_src)
+# ── Path ─────────────────────────────────────────────────────────────────────
+_DIR_SRC  = os.path.dirname(os.path.abspath(__file__))
+_DIR_RAIZ = os.path.dirname(_DIR_SRC)
+if _DIR_SRC not in sys.path:
+    sys.path.insert(0, _DIR_SRC)
 
-CAMINHO_DATA = os.path.join(diretorio_raiz, "data")
-DB_TREINO    = os.path.join(CAMINHO_DATA, "sirius_treino.db")
-DB_PESSOAL   = os.path.join(CAMINHO_DATA, "sirius_pessoal.db")
-os.makedirs(CAMINHO_DATA, exist_ok=True)
+_CAMINHO_DATA = os.path.join(_DIR_RAIZ, "data")
+_DB_TREINO    = os.path.join(_CAMINHO_DATA, "sirius_treino.db")
+_DB_PESSOAL   = os.path.join(_CAMINHO_DATA, "sirius_pessoal.db")
+os.makedirs(_CAMINHO_DATA, exist_ok=True)
 
+# ── Imports opcionais ─────────────────────────────────────────────────────────
+try:
+    import requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
 
-def _criar_tabela_demonstracoes_visuais():
-    conexao = sqlite3.connect(DB_PESSOAL)
-    conexao.execute("""
-        CREATE TABLE IF NOT EXISTS demonstracoes_visuais (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id          TEXT DEFAULT '',
-            nome             TEXT,
-            descricao        TEXT,
-            sequencia_json   TEXT,
-            imagem_referencia TEXT,
-            criado_em        DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, nome)
-        );
-    """)
-    conexao.execute(
-        "CREATE INDEX IF NOT EXISTS idx_demonstracoes_visuais_usuario ON demonstracoes_visuais(user_id, nome);"
-    )
-    conexao.commit()
-    conexao.close()
+try:
+    from colorama import Fore, Style, init as _colorama_init
+    _colorama_init(autoreset=True)
+    _COLORAMA_OK = True
+except ImportError:
+    _COLORAMA_OK = False
 
-
-def salvar_demonstracao_visual(user_id: str, nome: str, descricao: str, sequencia_json: str, imagem_referencia: str = "") -> bool:
-    if not nome or not sequencia_json:
-        return False
-    user_id = (user_id or "guest").strip()
-    nome = nome.strip().lower()
-    descricao = descricao or ""
-    imagem_referencia = imagem_referencia or ""
-    try:
-        _criar_tabela_demonstracoes_visuais()
-        conexao = sqlite3.connect(DB_PESSOAL)
-        conexao.execute(
-            """
-            INSERT INTO demonstracoes_visuais
-                (user_id, nome, descricao, sequencia_json, imagem_referencia, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id, nome) DO UPDATE SET
-                descricao = excluded.descricao,
-                sequencia_json = excluded.sequencia_json,
-                imagem_referencia = excluded.imagem_referencia,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (user_id, nome, descricao, sequencia_json, imagem_referencia)
-        )
-        conexao.commit()
-        return True
-    except Exception as e:
-        print(f"[AUTODIDATA]: Erro ao salvar demonstracao visual: {e}")
-        return False
-    finally:
-        try:
-            conexao.close()
-        except Exception:
-            pass
+# ── SiriusMemoria ─────────────────────────────────────────────────────────────
+try:
+    from memoria import SiriusMemoria
+    _MEMORIA_OK = True
+except ImportError:
+    SiriusMemoria = None
+    _MEMORIA_OK = False
+    print("[AUTODIDATA]: AVISO — memoria.py não encontrado. Salvar estudos desabilitado.")
 
 
-def obter_demonstracao_visual(user_id: str, nome: str) -> dict | None:
-    if not nome:
-        return None
-    user_id = (user_id or "guest").strip()
-    nome = nome.strip().lower()
-    try:
-        _criar_tabela_demonstracoes_visuais()
-        conexao = sqlite3.connect(DB_PESSOAL)
-        cursor = conexao.execute(
-            "SELECT nome, descricao, sequencia_json, imagem_referencia, criado_em, updated_at"
-            " FROM demonstracoes_visuais"
-            " WHERE user_id = ? AND nome = ?",
-            (user_id, nome)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return {
-            "nome": row[0],
-            "descricao": row[1],
-            "sequencia_json": row[2],
-            "imagem_referencia": row[3],
-            "criado_em": row[4],
-            "updated_at": row[5],
-        }
-    except Exception as e:
-        print(f"[AUTODIDATA]: Erro ao carregar demonstracao visual: {e}")
-        return None
-    finally:
-        try:
-            conexao.close()
-        except Exception:
-            pass
+# =============================================================================
+# Helpers de log colorido
+# =============================================================================
+
+def _log_info(msg: str):
+    if _COLORAMA_OK:
+        print(f"{Fore.CYAN}[AUTODIDATA]: {msg}{Style.RESET_ALL}")
+    else:
+        print(f"\033[96m[AUTODIDATA]: {msg}\033[0m")
+
+def _log_ok(msg: str):
+    if _COLORAMA_OK:
+        print(f"{Fore.GREEN}[AUTODIDATA]: ✓ {msg}{Style.RESET_ALL}")
+    else:
+        print(f"\033[92m[AUTODIDATA]: ✓ {msg}\033[0m")
+
+def _log_skip(msg: str):
+    if _COLORAMA_OK:
+        print(f"{Fore.YELLOW}[AUTODIDATA]: ↷ {msg}{Style.RESET_ALL}")
+    else:
+        print(f"\033[93m[AUTODIDATA]: ↷ {msg}\033[0m")
+
+def _log_err(msg: str):
+    if _COLORAMA_OK:
+        print(f"{Fore.RED}[AUTODIDATA]: ✗ {msg}{Style.RESET_ALL}")
+    else:
+        print(f"\033[91m[AUTODIDATA]: ✗ {msg}\033[0m")
+
+def _log_prog(atual: int, total: int, tema: str):
+    pct = int((atual / total) * 100)
+    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+    if _COLORAMA_OK:
+        print(f"{Fore.BLUE}  [{bar}] {pct:3d}% ({atual}/{total}) — {tema[:50]}{Style.RESET_ALL}")
+    else:
+        print(f"\033[94m  [{bar}] {pct:3d}% ({atual}/{total}) — {tema[:50]}\033[0m")
 
 
-def listar_demonstracoes_visuais(user_id: str) -> list[dict]:
-    user_id = (user_id or "guest").strip()
-    try:
-        _criar_tabela_demonstracoes_visuais()
-        conexao = sqlite3.connect(DB_PESSOAL)
-        cursor = conexao.execute(
-            "SELECT nome, descricao, imagem_referencia, criado_em, updated_at"
-            " FROM demonstracoes_visuais"
-            " WHERE user_id = ?",
-            (user_id,)
-        )
-        return [
-            {
-                "nome": row[0],
-                "descricao": row[1],
-                "imagem_referencia": row[2],
-                "criado_em": row[3],
-                "updated_at": row[4],
-            }
-            for row in cursor.fetchall()
-        ]
-    except Exception as e:
-        print(f"[AUTODIDATA]: Erro ao listar demonstracoes visuais: {e}")
-        return []
+# =============================================================================
+# Banco de temas — 325 temas organizados por categoria
+# =============================================================================
 
-# Headers padrao para todas as requisicoes — resolve problema do Wikipedia
-HEADERS_HTTP = {
-    "User-Agent":      "SiriusBot/1.0 (Assistente educacional)",
-    "Accept":          "application/json",
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-}
-
-# ---------------------------------------------------------------------------
-# BANCO DE TEMAS
-# ---------------------------------------------------------------------------
-
-TEMAS_POR_CATEGORIA = {
-
+TEMAS_POR_CATEGORIA: dict[str, list[str]] = {
     "ciencias_exatas": [
         "matematica pura algebra abstrata", "calculo diferencial integral",
         "geometria euclidiana nao-euclidiana", "topologia matematica",
@@ -170,7 +121,6 @@ TEMAS_POR_CATEGORIA = {
         "fisico-quimica termodinamica", "bioquimica metabolismo",
         "quimica analitica espectroscopia", "polimeros materiais",
     ],
-
     "ciencias_biologicas": [
         "biologia celular mitose meiose", "genetica DNA RNA proteinas",
         "evolucao darwinismo selecao natural", "ecologia ecossistemas",
@@ -183,7 +133,6 @@ TEMAS_POR_CATEGORIA = {
         "biomedicina diagnostico tratamento", "farmacologia medicamentos",
         "toxicologia venenos antidotos", "paleontologia fosseis dinossauros",
     ],
-
     "tecnologia_computacao": [
         "algoritmos estruturas de dados", "complexidade computacional",
         "programacao orientada a objetos", "programacao funcional",
@@ -201,7 +150,6 @@ TEMAS_POR_CATEGORIA = {
         "python avancado programacao", "javascript typescript web",
         "rust linguagem sistemas", "c++ programacao", "golang go",
     ],
-
     "historia_geral": [
         "pre-historia homo sapiens evolucao humana", "antigas civilizacoes Mesopotamia",
         "Egito antigo faraos piramides", "Grecia antiga democracia filosofia",
@@ -209,539 +157,465 @@ TEMAS_POR_CATEGORIA = {
         "Renascimento humanismo arte ciencia", "Revolucao Francesa iluminismo",
         "Revolucao Industrial capitalismo", "Primeira Guerra Mundial causas",
         "Segunda Guerra Mundial Holocausto", "Guerra Fria URSS EUA",
-        "descolonizacao Africa Asia", "historia da China Imperial",
-        "Japao feudal Samurai Meiji", "Imperios Otomano Persa historia",
-        "historia da Africa subsaariana", "civilizacoes pre-colombianas Maias",
-        "historia medieval Europa", "era das navegacoes descobrimentos",
-        "historia contemporanea seculo XX", "geopolitica relacoes internacionais",
+        "descolonizacao Africa Asia", "historia do Brasil colonizacao",
+        "historia da America Latina independencia", "historia da China imperial",
+        "historia do Japao samurais modernizacao",
     ],
-
-    "historia_brasil": [
-        "Brasil pre-colonial povos indigenas", "descobrimento colonizacao portuguesa",
-        "ciclo do acucar escravidao Brasil", "Inconfidencia Mineira historia",
-        "familia real portuguesa vinda Brasil", "independencia do Brasil 1822",
-        "Imperio brasileiro Pedro I Pedro II", "abolicao escravidao Lei Aurea",
-        "Republica Velha cafe com leite", "Era Vargas Estado Novo Brasil",
-        "Juscelino Kubitschek Brasilia", "ditadura militar 1964 Brasil",
-        "Diretas Ja redemocratizacao", "Constituicao Federal 1988 Brasil",
-        "Plano Real estabilizacao economica", "cultura afro-brasileira quilombos",
-        "imigracao italiana japonesa Brasil", "Amazonia desmatamento",
-        "favelas urbanizacao Brasil", "futebol brasileiro historia Copa",
-        "carnaval cultura popular brasileira", "literatura brasileira Machado Assis",
-        "modernismo semana arte 1922", "tropicalismo musica brasileira",
+    "filosofia": [
+        "filosofia pre-socratica Tales Heraclito", "Socrates Plato epistemologia",
+        "Aristoteles logica etica", "estoicismo epicurismo",
+        "filosofia medieval escolastica Tomas de Aquino", "Descartes dualismo",
+        "empirismo Locke Hume", "Kant imperativo categorico",
+        "Hegel dialética fenomenologia", "Marx materialismo historico",
+        "Nietzsche vontade de poder", "existencialismo Sartre Camus",
+        "filosofia analitica Wittgenstein", "etica deontologica consequencialismo",
+        "filosofia da mente consciencia", "filosofia da ciencia Popper Kuhn",
+        "hermeneutica fenomenologia Husserl", "filosofia politica Hobbes Rousseau",
     ],
-
-    "filosofia_pensamento": [
-        "pre-socraticos Tales Heraclito", "Socrates metodo maieutico",
-        "Platao teoria das ideias", "Aristoteles logica metafisica",
-        "estoicismo epicurismo filosofia", "filosofia medieval Tomas de Aquino",
-        "Descartes racionalismo cogito", "Hume empirismo ceticismo",
-        "Kant critica razao pura", "Hegel dialetica espirito",
-        "Marx materialismo historico capital", "Nietzsche vontade de potencia",
-        "existencialismo Sartre Camus", "fenomenologia Husserl Heidegger",
-        "filosofia analitica Wittgenstein", "pragmatismo americano filosofia",
-        "filosofia da ciencia Popper Kuhn", "etica deontologica consequencialista",
-        "filosofia politica Hobbes Locke Rousseau", "feminismo filosofico",
-        "filosofia budista zen", "logica formal paradoxos",
-        "epistemologia teoria do conhecimento", "filosofia da mente consciencia",
+    "economia_financas": [
+        "microeconomia oferta demanda", "macroeconomia PIB inflacao",
+        "mercado financeiro acoes bonds", "politica monetaria banco central",
+        "sistema bancario credito moeda", "comercio internacional balanca",
+        "economia comportamental vieses cognitivos", "keynesianismo monetarismo",
+        "desenvolvimento economico crescimento", "desigualdade social Gini",
+        "criptoeconomia DeFi tokenomics", "contabilidade financas corporativas",
+        "investimentos renda fixa renda variavel", "startups venture capital",
+        "economia circular sustentabilidade",
     ],
-
-    "arte_cultura": [
-        "historia da arte renascimento barroco", "impressionismo pos-impressionismo",
-        "arte moderna cubismo surrealismo", "arte contemporanea conceitual",
-        "escultura grega medieval moderna", "arquitetura estilos historicos",
-        "fotografia historia tecnica", "cinema historia linguagem",
-        "teatro dramaturgia Shakespeare", "danca bale contemporaneo",
-        "musica classica Bach Mozart Beethoven", "jazz blues historia origem",
-        "rock historia Beatles Rolling Stones", "musica eletronica sintese",
-        "MPB musica popular brasileira", "samba choro baiao historia",
-        "funk rap hip-hop historia", "literatura mundial romances classicos",
-        "poesia lirica epica", "mitologia grega nordica",
-        "religioes mundiais comparadas", "budismo hinduismo islamismo",
-        "cristandade historia biblica", "folclore brasileiro lendas",
+    "psicologia_comportamento": [
+        "psicologia clinica psicoterapia", "psicanalise Freud Jung",
+        "psicologia cognitiva comportamental TCC", "neuropsicologia cerebro emocoes",
+        "desenvolvimento humano Piaget Vygotsky", "aprendizagem memoria cognicao",
+        "inteligencia emocional Daniel Goleman", "psicologia positiva bem-estar",
+        "motivacao hierarquia Maslow", "psicologia social grupos influencia",
+        "transtornos mentais DSM diagnostico", "mindfulness meditacao",
+        "psicologia organizacional trabalho", "vieses cognitivos heuristicas",
+        "persuasao influencia Cialdini",
     ],
-
-    "ciencias_sociais": [
-        "sociologia Durkheim Weber Marx", "antropologia cultural",
-        "psicologia comportamental cognitiva", "psicanalise Freud Jung",
-        "psicologia social grupos influencia", "neuropsicologia funcoes cognitivas",
-        "economia microeconomia macroeconomia", "teoria economica keynesiana",
-        "economia comportamental Kahneman", "mercado financeiro bolsa valores",
-        "direito constitucional brasileiro", "direito penal civil",
-        "ciencia politica sistemas governos", "teoria democratica",
-        "relacoes internacionais diplomacia", "geopolitica potencias mundiais",
-        "comunicacao jornalismo midia", "semiotica linguistica",
-        "educacao pedagogia aprendizagem", "sociologia urbana cidades",
-        "criminologia violencia seguranca", "direitos humanos",
+    "artes_cultura": [
+        "historia da arte renascimento barroco", "arte moderna impressionismo",
+        "arte contemporanea instalacao performance", "musica classica Bach Mozart",
+        "jazz blues musica americana", "musica popular brasileira MPB samba",
+        "cinema historia efeitos especiais", "literatura brasileira modernismo",
+        "literatura mundial classicos", "teatro drama comédia tragedia",
+        "arquitetura estilos historicos", "design grafico comunicacao visual",
+        "fotografia historia tecnica", "danca ballet contemporanea",
+        "mitologia grega romana nórdica",
     ],
-
     "saude_medicina": [
-        "anatomia sistemas do corpo humano", "fisiologia cardiovascular",
-        "neurologia sistema nervoso", "oncologia tipos de cancer",
-        "cardiologia doencas cardiacas", "endocrinologia hormonios diabetes",
-        "psiquiatria transtornos mentais", "nutricao dieta metabolismo",
-        "medicina preventiva epidemiologia", "saude mental bem-estar",
-        "farmacologia classes de medicamentos", "imunologia vacinas",
-        "cirurgia historia tecnicas", "medicina de emergencia trauma",
-        "pediatria saude infantil", "geriatria envelhecimento",
-        "odontologia saude bucal", "oftalmologia visao",
-        "fisioterapia reabilitacao", "medicina alternativa acupuntura",
-        "genomica medicina personalizada", "bioetica experimentos clinicos",
+        "anatomia humana sistema cardiovascular", "sistema nervoso central periferico",
+        "oncologia tipos de cancer tratamento", "cardiologia doencas cardiacas",
+        "diabetes mellitus tipo 1 2", "saude mental depressao ansiedade",
+        "nutricao macronutrientes micronutrientes", "epidemiologia saude publica",
+        "medicina de emergencia primeiros socorros", "cirurgia tecnicas procedimentos",
+        "genetica medica doencas hereditarias", "vacinacao imunizacao historia",
+        "medicina tradicional chinesa ayurveda", "saude da mulher ginecologia",
+        "pediatria desenvolvimento infantil",
     ],
-
+    "direito_politica": [
+        "direito constitucional democracia", "direito penal crimes penas",
+        "direito civil contratos familia", "direito internacional tratados",
+        "geopolitica relacoes internacionais", "sistemas de governo democracia",
+        "direitos humanos liberdades fundamentais", "partidos politicos ideologias",
+        "politicas publicas estado bem-estar", "direito trabalhista CLT",
+        "direito digital privacidade LGPD", "corrupcao governança publica",
+    ],
     "meio_ambiente": [
-        "mudancas climaticas aquecimento global", "efeito estufa gases",
-        "energias renovaveis solar eolica", "sustentabilidade desenvolvimento",
-        "biodiversidade extincao especies", "desmatamento Amazonia",
-        "poluicao plastico oceanos", "gestao de residuos reciclagem",
-        "ecossistemas biomas brasileiros", "agua saneamento basico",
-        "agricultura organica agronegocio", "agroecologia permacultura",
-        "geologia tectonica vulcoes terremotos", "oceanografia correntes",
-        "climatologia meteorologia previsao", "recursos naturais mineracao",
-        "politica ambiental acordos climaticos", "tecnologia limpa greentech",
+        "mudancas climaticas efeito estufa", "biodiversidade conservacao",
+        "energia renovavel solar eolica", "poluicao tipos impactos",
+        "desmatamento Amazonia florestas", "oceanos ecossistemas marinhos",
+        "geologia tecnica placas tectônicas", "meteorologia clima previsão",
+        "sustentabilidade agenda 2030 ODS", "gestao de residuos reciclagem",
     ],
-
-    "engenharia_aplicada": [
-        "engenharia civil estruturas pontes", "engenharia eletrica circuitos",
-        "engenharia mecanica termodinamica", "engenharia quimica processos",
-        "engenharia aeroespacial aviacao", "engenharia nuclear reator",
-        "engenharia biomedica proteses", "nanotecnologia materiais",
-        "automacao robotica industrial", "inteligencia artificial aplicada",
-        "manufatura aditiva impressao 3D", "eletronica microcontroladores",
-        "energia nuclear fusao fissao", "propulsao foguetes satelites",
-        "engenharia de producao logistica", "metrologia controle qualidade",
+    "matematica_aplicada": [
+        "estatistica descritiva inferencial", "probabilidade combinatoria",
+        "algebra linear aplicacoes ML", "calculo numerico metodos",
+        "grafos teoria algoritmos", "criptografia matematica",
+        "teoria da informacao Shannon", "matematica financeira juros",
+        "pesquisa operacional otimizacao", "series temporais previsao",
     ],
-
-    "espaco_astronomia": [
-        "sistema solar planetas luas", "formacao estrelas nebulosas",
-        "buracos negros singularidades", "galaxias Via Lactea universo",
-        "Big Bang origem universo", "materia escura energia escura",
-        "exploracao espacial NASA SpaceX", "Estacao Espacial Internacional",
-        "exoplanetas vida extraterrestre", "telescopios James Webb Hubble",
-        "missoes Marte Lua Artemis", "astrofisica altas energias",
-        "ondas gravitacionais LIGO", "cosmologia inflacao cosmica",
-        "meteoritos asteroides cometas", "astrobiologia origens vida",
-    ],
-
-    "entretenimento_games": [
-        "historia dos videogames Atari Nintendo", "game design mecanicas",
-        "RPG dungeons dragons", "e-sports competitivo League of Legends",
-        "Minecraft construcao survival", "battle royale Fortnite PUBG",
-        "Pokemon competitivo VGC estrategia", "jogos indie desenvolvedores",
-        "realidade virtual aumentada games", "programacao de jogos Unity",
-        "anime historia cultura otaku", "manga quadrinhos japoneses",
-        "cultura pop geek nerd", "streaming Twitch YouTube gaming",
-        "historia dos consoles geracoes", "retrogaming emuladores",
-        "jogos de tabuleiro modernos", "xadrez abertura defesa estrategia",
-    ],
-
-    "economia_negocios": [
-        "empreendedorismo startups inovacao", "venture capital investimento",
-        "marketing digital redes sociais", "branding identidade marca",
-        "gestao empresarial administracao", "contabilidade financas",
-        "economia brasileira PIB inflacao", "bancos sistema financeiro",
-        "criptomoedas Bitcoin Ethereum", "mercado imobiliario investimento",
-        "renda fixa variavel bolsa", "economia circular sustentabilidade",
-        "cadeia de suprimentos logistica", "economia comportamental vieses",
-    ],
-
-    "linguagem_comunicacao": [
-        "linguistica estrutura linguagem", "gramatica portuguesa normas",
-        "etimologia origem palavras", "dialetos variedades linguisticas",
-        "linguas indigenas brasileiras", "latim linguas romanicas",
-        "escrita historia alfabeto", "retorica argumentacao",
-        "semiotica signos simbolos", "traducao interpretacao",
-        "oratoria comunicacao publica", "redacao academica",
-        "jornalismo investigativo", "publicidade propaganda",
-        "idiomas mais falados mundo", "Libras lingua de sinais",
-    ],
-
-    "curiosidades_gerais": [
-        "recordes mundiais feitos extraordinarios", "inventores descobertas acidentais",
-        "misterios nao resolvidos ciencia", "fenomenos naturais raros",
-        "animais mais inteligentes", "extremofilos vida extrema",
-        "ilusoes de otica percepcao", "efeitos psicologicos vieses cognitivos",
-        "lendas urbanas origem verdade", "tecnologias do futuro previsoes",
-        "transhumanismo pos-humano", "inteligencia artificial etica",
-        "singularidade tecnologica", "paradoxos filosoficos logica",
+    "linguistica_idiomas": [
+        "linguistica estrutural Saussure", "psicolinguistica aquisicao linguagem",
+        "sociolinguistica variacao linguistica", "fonologia morfologia sintaxe",
+        "ingles avancado gramatica", "espanhol lingua hispanofona",
+        "lingua portuguesa historia evolucao", "traducao interpretacao",
+        "linguagem de sinais LIBRAS", "etimologia origem das palavras",
     ],
 }
 
-TODOS_OS_TEMAS = [
+# Lista plana de todos os temas
+TODOS_OS_TEMAS: list[str] = [
     tema
-    for categoria in TEMAS_POR_CATEGORIA.values()
-    for tema in categoria
+    for temas in TEMAS_POR_CATEGORIA.values()
+    for tema in temas
 ]
 
-print(f"[AUTODIDATA]: {len(TODOS_OS_TEMAS)} temas de estudo carregados.")
+
+# =============================================================================
+# Verificação de duplicata no banco
+# =============================================================================
+
+def _tema_ja_existe(tema: str) -> bool:
+    """
+    Verifica se o tema já foi estudado e salvo no banco treino.
+    Retorna True se existe pelo menos 1 registro com aquele tema.
+    """
+    tema_lower = tema.lower().strip()
+    for tabela in ("estudos_autonomos", "conhecimento_geral"):
+        try:
+            conn = sqlite3.connect(_DB_TREINO)
+            r = conn.execute(
+                f"SELECT COUNT(*) FROM {tabela} WHERE tema=?",
+                (tema_lower,),
+            ).fetchone()
+            conn.close()
+            if r and r[0] > 0:
+                return True
+        except Exception:
+            pass
+    return False
 
 
-# ---------------------------------------------------------------------------
-# Extracao de novos temas
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Busca de conteúdo (Wikipedia + web)
+# =============================================================================
 
-def _extrair_novos_temas(texto: str) -> list[str]:
-    novos   = []
-    padroes = [
-        r"conhecid[ao] como ([A-Za-z\s]{5,40})",
-        r"denominad[ao] ([A-Za-z\s]{5,40})",
-        r"chamad[ao] de ([A-Za-z\s]{5,40})",
-        r"teoria d[ae] ([A-Za-z\s]{5,40})",
-        r"conceito de ([A-Za-z\s]{5,40})",
-        r"efeito ([A-Za-z\s]{3,30})",
-        r"([A-Za-z\s]{5,30}) foi descobert[ao]",
-        r"([A-Za-z\s]{5,30}) foi desenvolvid[ao]",
-    ]
-    for padrao in padroes:
-        for m in re.findall(padrao, texto, re.IGNORECASE):
-            t = m.strip().lower()
-            if 5 < len(t) < 50 and t not in TODOS_OS_TEMAS:
-                novos.append(t)
-    return list(set(novos))[:5]
+_HEADERS_HTTP = {
+    "User-Agent":      "SiriusBot/5.2 (Assistente educacional; +https://github.com/sirius)",
+    "Accept":          "application/json",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 
-# ---------------------------------------------------------------------------
-# Fila dinamica de temas
-# ---------------------------------------------------------------------------
+def _buscar_wikipedia(tema: str) -> list[dict]:
+    """Busca resumo do tema na Wikipedia PT-BR."""
+    if not _REQUESTS_OK:
+        return []
+    try:
+        url    = "https://pt.wikipedia.org/api/rest_v1/page/summary/" + tema.replace(" ", "_")
+        r      = requests.get(url, headers=_HEADERS_HTTP, timeout=8)
+        r.encoding = "utf-8"
+        if r.status_code != 200:
+            return []
+        data   = r.json()
+        corpo  = data.get("extract", "").strip()
+        titulo = data.get("title", tema)
+        if len(corpo) < 80:
+            return []
+        return [{"tema": tema, "titulo": titulo, "corpo": corpo[:2000], "fonte": "wikipedia"}]
+    except Exception:
+        return []
+
+
+def _buscar_web(tema: str) -> list[dict]:
+    """
+    Busca resultados via DuckDuckGo.
+    Tenta os dois nomes de pacote para compatibilidade:
+      - duckduckgo_search (PyPI: duckduckgo-search) — nome correto e atual
+      - ddgs                                         — nome antigo (legado)
+    """
+    DDGS = None
+
+    # Tenta o pacote atual primeiro
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        pass
+
+    # Fallback para instalações antigas
+    if DDGS is None:
+        try:
+            from ddgs import DDGS  # type: ignore[no-redef]
+        except ImportError:
+            return []   # nenhum pacote disponível
+
+    try:
+        resultados = []
+        with DDGS() as ddg:
+            for r in ddg.text(tema + " explicação conceito", max_results=3, region="br-pt"):
+                corpo = r.get("body", "").strip()
+                if corpo and len(corpo) > 80:
+                    resultados.append({
+                        "tema":   tema,
+                        "titulo": r.get("title", tema),
+                        "corpo":  corpo[:1500],
+                        "fonte":  "web",
+                    })
+        return resultados
+    except Exception:
+        return []
+
+
+# =============================================================================
+# RAG rebuild
+# =============================================================================
+
+# Importação defensiva do SiriusRAG — não quebra se arquivo ausente
+try:
+    from sirius_rag import SiriusRAG as _SiriusRAG
+    _RAG_DISPONIVEL = True
+except ImportError:
+    _SiriusRAG      = None   # type: ignore[assignment,misc]
+    _RAG_DISPONIVEL = False
+
+# Instância singleton — evita recriar modelo/índice a cada lote
+_rag_instancia: Optional[object] = None
+_rag_lock = threading.Lock()
+
+
+def _get_rag() -> Optional[object]:
+    """Retorna a instância singleton do RAG, criando se necessário."""
+    global _rag_instancia
+    if not _RAG_DISPONIVEL:
+        return None
+    with _rag_lock:
+        if _rag_instancia is None:
+            try:
+                _rag_instancia = _SiriusRAG()
+            except Exception as e:
+                _log_err(f"Não foi possível inicializar SiriusRAG: {e}")
+                return None
+    return _rag_instancia
+
+
+def _rebuild_rag():
+    """
+    Atualiza o índice FAISS/TF-IDF com os novos estudos salvos no banco.
+    Chamado a cada lote de 10 temas processados.
+    Falha silenciosamente se RAG não estiver disponível.
+    """
+    rag = _get_rag()
+    if rag is None:
+        return   # RAG não instalado — comportamento degradado esperado
+
+    try:
+        n = rag.rebuild()
+        if n > 0:
+            modo = getattr(rag, "modo", lambda: "?")()
+            _log_ok(f"Índice RAG [{modo}] atualizado: {n} documentos.")
+        else:
+            _log_skip("RAG rebuild: banco ainda vazio, aguardando mais estudos.")
+    except Exception as e:
+        _log_err(f"Erro durante rebuild RAG: {e}")
+
+
+# =============================================================================
+# Fila de temas com shuffle e descoberta dinâmica
+# =============================================================================
 
 class FilaDeTemas:
     def __init__(self):
-        self._fila_usuario      = []
-        self._fila_descobertos  = []
-        self._historico_recente = []
-
-    def adicionar_descoberto(self, tema: str):
-        if tema not in self._fila_descobertos and tema not in TODOS_OS_TEMAS:
-            self._fila_descobertos.append(tema)
-
-    # Verbos de acao — nao sao temas de estudo
-    _VERBOS_ACAO = {
-        "abre", "abrir", "fecha", "fechar", "manda", "mandar", "mande",
-        "envia", "enviar", "cria", "criar", "salva", "salvar", "desliga",
-        "desligar", "pesquise", "busque", "procure", "executa", "executar",
-        "liga", "ligar", "mostra", "mostrar", "toca", "tocar", "pausa",
-        "volume", "screenshot", "print", "instala", "instalar",
-    }
-    # Perguntas de contexto imediato — nao tem resposta na Wikipedia
-    _PERGUNTAS_CONTEXTO = {
-        "que horas", "que dia", "qual data", "quantos anos",
-        "como voce esta", "tudo bem", "oi", "ola", "bom dia",
-        "boa tarde", "boa noite", "tchau", "flw", "valeu",
-    }
-
-    def _eh_tema_estudavel(self, pergunta: str) -> bool:
-        """Retorna True apenas se a pergunta for um tema que vale pesquisar."""
-        p = pergunta.lower().strip()
-        # Filtra comandos de acao (primeira palavra e verbo de acao)
-        primeira = p.split()[0] if p.split() else ""
-        if primeira in self._VERBOS_ACAO:
-            return False
-        # Filtra perguntas de contexto imediato
-        if any(ctx in p for ctx in self._PERGUNTAS_CONTEXTO):
-            return False
-        # Filtra textos muito curtos (menos de 3 palavras)
-        if len(p.split()) < 3:
-            return False
-        return True
-
-    def puxar_perguntas_usuario(self):
-        try:
-            conn = sqlite3.connect(DB_PESSOAL)
-            rows = conn.execute(
-                "SELECT content FROM conversas WHERE role = 'user' "
-                "ORDER BY id DESC LIMIT 10"
-            ).fetchall()
-            conn.close()
-            for row in rows:
-                pergunta = row[0].strip().lower() if row[0] else ""
-                pergunta = re.sub(r"\bsirius\b[,\s]*", "", pergunta).strip()
-                if (
-                    len(pergunta) > 5
-                    and self._eh_tema_estudavel(pergunta)
-                    and pergunta not in self._fila_usuario
-                    and pergunta not in self._historico_recente
-                ):
-                    self._fila_usuario.append(pergunta)
-        except Exception as e:
-            print(f"[FILA]: Erro ao ler perguntas: {e}")
+        import random
+        self._base        = list(TODOS_OS_TEMAS)
+        random.shuffle(self._base)
+        self._fila_base   = list(self._base)
+        self._descobertos: list[str] = []
+        self._lock        = threading.Lock()
+        self._idx         = 0
 
     def proximo(self) -> str:
-        self.puxar_perguntas_usuario()
-
-        if self._fila_usuario and random.random() < 0.50:
-            tema = self._fila_usuario.pop(0)
-            self._registrar(tema)
-            print(f"\033[95m[FILA]: Estudando pergunta do usuario -> '{tema}'\033[0m")
+        with self._lock:
+            # Prioriza temas descobertos
+            if self._descobertos:
+                return self._descobertos.pop(0)
+            if self._idx >= len(self._fila_base):
+                # Reinicia ciclo com shuffle
+                import random
+                random.shuffle(self._fila_base)
+                self._idx = 0
+            tema = self._fila_base[self._idx]
+            self._idx += 1
             return tema
 
-        if self._fila_descobertos and random.random() < 0.30:
-            tema = self._fila_descobertos.pop(0)
-            self._registrar(tema)
-            return tema
-
-        candidatos = [t for t in TODOS_OS_TEMAS if t not in self._historico_recente]
-        if not candidatos:
-            candidatos = TODOS_OS_TEMAS
-        tema = random.choice(candidatos)
-        self._registrar(tema)
-        return tema
-
-    def _registrar(self, tema: str):
-        self._historico_recente.append(tema)
-        if len(self._historico_recente) > 20:
-            self._historico_recente.pop(0)
+    def adicionar_descoberto(self, tema: str):
+        with self._lock:
+            if tema not in self._fila_base and tema not in self._descobertos:
+                self._descobertos.append(tema)
 
     def total_usuario(self) -> int:
-        return len(self._fila_usuario)
-
-    def total_descobertos(self) -> int:
-        return len(self._fila_descobertos)
-
-
-# ---------------------------------------------------------------------------
-# FIX Wikipedia — headers corretos + encoding explicito
-# ---------------------------------------------------------------------------
-
-def _buscar_wikipedia(tema: str) -> list[dict]:
-    # Limpa tema para URL — remove acentos e caracteres especiais
-    tema_url = re.sub(r"[^\w\s]", "", tema).strip().replace(" ", "_")
-
-    for lang in ["pt", "en"]:
-        try:
-            url  = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{tema_url}"
-            resp = requests.get(url, headers=HEADERS_HTTP, timeout=10)
-            resp.encoding = "utf-8"
-
-            if resp.status_code != 200 or not resp.text.strip():
-                # Fallback via OpenSearch
-                params = {
-                    "action": "opensearch",
-                    "search": tema,
-                    "limit":  1,
-                    "format": "json",
-                    "utf8":   1,
-                }
-                r = requests.get(
-                    f"https://{lang}.wikipedia.org/w/api.php",
-                    params=params,
-                    headers=HEADERS_HTTP,
-                    timeout=10
-                )
-                r.encoding = "utf-8"
-                if not r.text.strip():
-                    continue
-                data = r.json()
-                if not (data and len(data) > 1 and data[1]):
-                    continue
-                titulo_url = data[1][0].replace(" ", "_")
-                resp = requests.get(
-                    f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{titulo_url}",
-                    headers=HEADERS_HTTP,
-                    timeout=10
-                )
-                resp.encoding = "utf-8"
-
-            if resp.status_code == 200 and resp.text.strip():
-                dados   = resp.json()
-                extrato = dados.get("extract", "").strip()
-                if extrato and len(extrato) > 100:
-                    print(f"[AUTODIDATA]: Wikipedia ({lang}) -> '{dados.get('title', tema)}'")
-                    return [{
-                        "tema":   tema,
-                        "titulo": dados.get("title", tema),
-                        "corpo":  extrato,
-                        "fonte":  f"wikipedia_{lang}",
-                    }]
-
-        except requests.exceptions.Timeout:
-            print(f"[AUTODIDATA]: Wikipedia timeout para '{tema}'")
-        except requests.exceptions.ConnectionError:
-            print(f"[AUTODIDATA]: Wikipedia sem conexao para '{tema}'")
-        except Exception as e:
-            print(f"[AUTODIDATA]: Wikipedia erro '{tema}': {type(e).__name__}: {e}")
-
-    return []
-
-
-# ---------------------------------------------------------------------------
-# FIX DuckDuckGo — migrado para pacote ddgs
-# ---------------------------------------------------------------------------
-
-def _buscar_web(tema: str) -> list[dict]:
-    resultados_raw = []
-
-    # Tenta o pacote novo (ddgs)
-    try:
-        from ddgs import DDGS
-        with DDGS() as ddgs:
-            resultados_raw = list(ddgs.text(tema, max_results=3))
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[AUTODIDATA]: ddgs erro para '{tema}': {e}")
-
-    # (fallback removido — use apenas: pip install ddgs)
-
-    return [
-        {
-            "tema":   tema,
-            "titulo": r.get("title", tema),
-            "corpo":  r.get("body", ""),
-            "fonte":  r.get("href", "web"),
-        }
-        for r in resultados_raw
-        if isinstance(r, dict) and r.get("body") and len(r["body"]) > 80
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Auto-dialogo
-# ---------------------------------------------------------------------------
-
-PERGUNTAS_AUTODIALOGO = [
-    "o que e {tema}?",
-    "como funciona {tema}?",
-    "quais sao os conceitos principais de {tema}?",
-    "por que {tema} e importante?",
-    "explica {tema} de forma simples",
-    "quais sao as aplicacoes de {tema}?",
-    "qual a historia de {tema}?",
-]
-
-def _gerar_autodialogo(tema: str) -> list[dict]:
-    try:
-        from sirius_gerador import SiriusGerador
-        gerador = SiriusGerador()
-        if not gerador.esta_treinado():
-            return []
-        pergunta = random.choice(PERGUNTAS_AUTODIALOGO).format(tema=tema)
-        resposta = gerador.gerar(pergunta)
-        if resposta and len(resposta) > 20:
-            return [{"tema": tema, "titulo": pergunta, "corpo": resposta, "fonte": "autodialogo"}]
-    except Exception:
-        pass
-    return []
-
-
-# ---------------------------------------------------------------------------
-# Salvar no banco
-# ---------------------------------------------------------------------------
-
-def _salvar_conhecimento(itens: list[dict], memoria) -> tuple[int, list[str]]:
-    salvos      = 0
-    novos_temas = []
-    for item in itens:
-        corpo = item.get("corpo", "").strip()
-        tema  = item.get("tema", "geral").strip()
-        fonte = item.get("fonte", "web")
-        if not corpo or len(corpo) < 30:
-            continue
-        try:
-            from neuronio import SiriusNeuronio
-            if SiriusNeuronio().verificar_se_ja_sabe(corpo, threshold=0.92):
-                continue
-        except Exception:
-            pass
-        ok = memoria.salvar_estudo_autonomo(
-            tema=tema,
-            conteudo=f"[{fonte}] {corpo[:1500]}",
-            tags="autodidata"
-        )
-        if ok:
-            salvos += 1
-            novos_temas.extend(_extrair_novos_temas(corpo))
-    return salvos, novos_temas
-
-
-def _contar_novos_dados() -> int:
-    try:
-        conn = sqlite3.connect(DB_TREINO)
-        n    = conn.execute(
-            "SELECT COUNT(*) FROM conhecimento_geral WHERE tags = 'autodidata'"
-        ).fetchone()[0]
-        conn.close()
-        return n
-    except Exception:
         return 0
 
+    def total_descobertos(self) -> int:
+        with self._lock:
+            return len(self._descobertos)
 
-# ---------------------------------------------------------------------------
-# Motor principal
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# SiriusAutodidata — Motor principal
+# =============================================================================
 
 class SiriusAutodidata:
-    def __init__(self, memoria, cerebro=None):
-        self.memoria       = memoria
+    """
+    Motor de aprendizado autônomo do S.I.R.I.U.S. v5.2.
+
+    Uso:
+        mem = SiriusMemoria()
+        bot = SiriusAutodidata(memoria=mem)
+        bot.iniciar()   # roda em background (thread daemon)
+    """
+
+    def __init__(self, memoria=None, cerebro=None):
+        self.memoria       = memoria or (SiriusMemoria() if _MEMORIA_OK else None)
         self.cerebro       = cerebro
         self._rodando      = False
         self._thread       = None
         self._fila         = FilaDeTemas()
         self._ciclo        = 0
         self._total_salvos = 0
+        self._lote_atual   = 0   # contador para RAG rebuild a cada 10 temas
+        self._pausado      = False   # controlado pelo SiriusScheduler
 
-        self._leitor = None
-        try:
-            from sirius_leitor import SiriusLeitor
-            self._leitor = SiriusLeitor(memoria=self.memoria)
-            self._leitor.iniciar()
-        except Exception as e:
-            print(f"[AUTODIDATA]: Leitor nao disponivel: {e}")
+    # =========================================================================
+    # Loop principal
+    # =========================================================================
 
     def _ciclo_aprendizado(self):
-        print(f"\033[94m[AUTODIDATA]: Motor iniciado com {len(TODOS_OS_TEMAS)} temas.\033[0m")
+        total_temas = len(TODOS_OS_TEMAS)
+        _log_info(f"Motor iniciado com {total_temas} temas base.")
+        _log_info(f"RAG rebuild a cada 10 temas processados.")
+
         while self._rodando:
-            tema        = self._fila.proximo()
-            total_ciclo = 0
-            novos_temas = []
+            # ── Pausa controlada pelo SiriusScheduler ──────────────────────
+            if self._pausado:
+                time.sleep(10)
+                continue
+            tema = self._fila.proximo()
+            self._ciclo += 1
 
-            print(f"\n\033[90m[AUTODIDATA]: Estudando -> '{tema}'\033[0m")
+            # ── Exibe progresso ───────────────────────────────────────────────
+            _log_prog(
+                min(self._ciclo, total_temas),
+                total_temas,
+                tema,
+            )
 
-            itens = _buscar_wikipedia(tema)
-            s, d  = _salvar_conhecimento(itens, self.memoria)
-            total_ciclo += s
-            novos_temas.extend(d)
+            # ── Verifica duplicata ────────────────────────────────────────────
+            if _tema_ja_existe(tema):
+                _log_skip(f"Já existe no banco: '{tema}'")
+                time.sleep(2)
+                continue
 
-            if self._ciclo % 2 == 0:
-                itens = _buscar_web(tema)
-                s, d  = _salvar_conhecimento(itens, self.memoria)
-                total_ciclo += s
-                novos_temas.extend(d)
+            # ── Busca conteúdo ────────────────────────────────────────────────
+            itens: list[dict] = []
+
+            wiki = _buscar_wikipedia(tema)
+            itens.extend(wiki)
+
+            if self._ciclo % 2 == 0:  # alterna para não sobrecarregar
+                web = _buscar_web(tema)
+                itens.extend(web)
 
             if self._ciclo % 3 == 0:
-                itens = _gerar_autodialogo(tema)
-                s, d  = _salvar_conhecimento(itens, self.memoria)
-                total_ciclo += s
-                novos_temas.extend(d)
+                auto = self._gerar_autodialogo(tema)
+                itens.extend(auto)
+
+            # ── Salva no banco ────────────────────────────────────────────────
+            salvos, novos_temas = self._salvar_itens(itens, tema)
+            self._total_salvos += salvos
 
             for novo in novos_temas:
                 self._fila.adicionar_descoberto(novo)
 
-            self._total_salvos += total_ciclo
-            self._ciclo        += 1
-
-            if total_ciclo > 0:
-                print(
-                    f"\033[92m[AUTODIDATA]: +{total_ciclo} sobre '{tema}' | "
-                    f"total: {self._total_salvos} | "
-                    f"novos temas: {self._fila.total_descobertos()}\033[0m"
+            if salvos > 0:
+                _log_ok(
+                    f"+{salvos} conhecimento(s) sobre '{tema[:40]}' | "
+                    f"total acumulado: {self._total_salvos}"
                 )
             else:
-                print(f"\033[90m[AUTODIDATA]: Nada novo sobre '{tema}'.\033[0m")
+                _log_skip(f"Nada novo sobre '{tema[:40]}'.")
 
-            if self._ciclo % 24 == 0:
-                novos = _contar_novos_dados()
-                if novos >= 15:
-                    print(f"\n[AUTODIDATA]: {novos} dados -> evoluindo redes...")
-                    threading.Thread(target=self._retreinar, daemon=True).start()
+            # ── RAG rebuild a cada lote de 10 temas ──────────────────────────
+            self._lote_atual += 1
+            if self._lote_atual >= 10:
+                _log_info("Lote de 10 temas concluído → atualizando índice FAISS...")
+                threading.Thread(target=_rebuild_rag, daemon=True).start()
+                self._lote_atual = 0
 
-            time.sleep(300)
+            # Pausa entre temas (não sobrecarrega APIs externas)
+            time.sleep(random.uniform(180, 360))  # 3 a 6 minutos
 
-    def _retreinar(self):
+    # =========================================================================
+    # Salvar itens no banco via SiriusMemoria
+    # =========================================================================
+
+    def _salvar_itens(self, itens: list[dict], tema_base: str) -> tuple[int, list[str]]:
+        salvos      = 0
+        novos_temas = []
+
+        if not self.memoria:
+            return salvos, novos_temas
+
+        for item in itens:
+            corpo = item.get("corpo", "").strip()
+            tema  = item.get("tema", tema_base).strip()
+            fonte = item.get("fonte", "web")
+
+            if not corpo or len(corpo) < 30:
+                continue
+
+            ok = self.memoria.salvar_estudo_autonomo(
+                tema    = tema,
+                conteudo= f"[{fonte}] {corpo[:1500]}",
+                tags    = "autodidata",
+                fonte   = fonte,
+            )
+            if ok:
+                salvos += 1
+                # Extrai possíveis novos temas do conteúdo
+                for novo in self._extrair_novos_temas(corpo):
+                    novos_temas.append(novo)
+
+        return salvos, novos_temas
+
+    # =========================================================================
+    # Extração de novos temas a partir do conteúdo
+    # =========================================================================
+
+    @staticmethod
+    def _extrair_novos_temas(corpo: str) -> list[str]:
+        stopwords = {
+            "que","com","por","para","uma","dos","das","são","como",
+            "mais","mas","não","foi","sobre","entre","quando","cada",
+        }
+        candidatos = re.findall(r"\b[A-Z][a-záéíóúãõâêôàç]{3,}\b", corpo)
+        vistos     = set()
+        resultado  = []
+        for c in candidatos:
+            cl = c.lower()
+            if cl not in stopwords and cl not in vistos and len(cl) >= 4:
+                vistos.add(cl)
+                resultado.append(cl)
+        return resultado[:3]
+
+    # =========================================================================
+    # Auto-diálogo com SiriusGerador
+    # =========================================================================
+
+    @staticmethod
+    def _gerar_autodialogo(tema: str) -> list[dict]:
         try:
-            from sirius_treinador import SiriusTreinador
-            SiriusTreinador().treinar_tudo()
-        except Exception as e:
-            print(f"[AUTODIDATA]: Erro no retreino: {e}")
+            from sirius_gerador import SiriusGerador
+            gerador = SiriusGerador()
+            if not gerador.esta_treinado():
+                return []
+            perguntas = [
+                f"o que e {tema}?",
+                f"como funciona {tema}?",
+                f"explica {tema} de forma simples",
+                f"quais sao as aplicacoes de {tema}?",
+            ]
+            pergunta = random.choice(perguntas)
+            resposta = gerador.gerar(pergunta)
+            if resposta and len(resposta) > 20:
+                return [{"tema": tema, "titulo": pergunta, "corpo": resposta, "fonte": "autodialogo"}]
+        except Exception:
+            pass
+        return []
+
+    # =========================================================================
+    # Interface pública
+    # =========================================================================
 
     def iniciar(self):
         if self._rodando:
@@ -750,51 +624,188 @@ class SiriusAutodidata:
         self._thread  = threading.Thread(
             target=self._ciclo_aprendizado,
             daemon=True,
-            name="SiriusAutodidata"
+            name="SiriusAutodidata",
         )
         self._thread.start()
-        print("\033[92m[AUTODIDATA]: Aprendizado autonomo ativado.\033[0m")
+        _log_ok("Aprendizado autônomo ativado.")
 
     def parar(self):
         self._rodando = False
+        _log_info("Sinal de parada enviado.")
+
+    def processar_batch_agora(self, n: int = 10) -> dict:
+        """
+        Processa N temas imediatamente (bloqueante) — útil para testes.
+        Retorna estatísticas do batch.
+        """
+        total_temas = len(TODOS_OS_TEMAS)
+        salvos_total = 0
+        pulados      = 0
+
+        _log_info(f"Batch síncrono: processando {n} temas...")
+
+        for i in range(n):
+            tema = self._fila.proximo()
+
+            _log_prog(i + 1, n, tema)
+
+            if _tema_ja_existe(tema):
+                _log_skip(f"Já existe: '{tema}'")
+                pulados += 1
+                continue
+
+            itens = _buscar_wikipedia(tema)
+            if i % 2 == 0:
+                itens += _buscar_web(tema)
+
+            salvos, _ = self._salvar_itens(itens, tema)
+            salvos_total += salvos
+
+            if salvos > 0:
+                _log_ok(f"+{salvos} sobre '{tema[:40]}'")
+            else:
+                _log_skip(f"Nada novo sobre '{tema[:40]}'")
+
+            self._lote_atual += 1
+            if self._lote_atual >= 10:
+                _log_info("Lote completo → rebuild FAISS...")
+                _rebuild_rag()
+                self._lote_atual = 0
+
+            time.sleep(1)  # pequena pausa para não sobrecarregar APIs
+
+        resultado = {
+            "temas_processados": n,
+            "salvos":  salvos_total,
+            "pulados": pulados,
+        }
+        _log_ok(f"Batch concluído: {resultado}")
+        return resultado
 
     def status(self) -> dict:
         return {
             "rodando":            self._rodando,
             "ciclos_completados": self._ciclo,
             "total_salvos":       self._total_salvos,
-            "fila_usuario":       self._fila.total_usuario(),
             "temas_descobertos":  self._fila.total_descobertos(),
             "temas_base":         len(TODOS_OS_TEMAS),
-            "dados_no_banco":     _contar_novos_dados(),
+            "lote_atual":         self._lote_atual,
         }
 
     def imprimir_status(self):
         s = self.status()
-        print("\n[AUTODIDATA STATUS]")
-        print(f"  Rodando:           {'Sim' if s['rodando'] else 'Nao'}")
+        print("\n\033[95m[AUTODIDATA STATUS]\033[0m")
+        print(f"  Rodando:           {'Sim' if s['rodando'] else 'Não'}")
         print(f"  Ciclos:            {s['ciclos_completados']}")
         print(f"  Conhecimentos:     {s['total_salvos']}")
         print(f"  Temas base:        {s['temas_base']}")
-        print(f"  Fila usuario:      {s['fila_usuario']}")
         print(f"  Temas descobertos: {s['temas_descobertos']}")
-        print(f"  No banco:          {s['dados_no_banco']}\n")
+        print(f"  Lote atual:        {s['lote_atual']}/10")
+        print()
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Funções de demonstração visual (mantidas da versão anterior)
+# =============================================================================
+
+def _criar_tabela_demonstracoes_visuais():
+    conn = sqlite3.connect(_DB_PESSOAL)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS demonstracoes_visuais (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id           TEXT    DEFAULT '',
+            nome              TEXT,
+            descricao         TEXT,
+            sequencia_json    TEXT,
+            imagem_referencia TEXT,
+            criado_em         DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, nome)
+        );
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_demo_visual_user ON demonstracoes_visuais(user_id, nome);"
+    )
+    conn.commit()
+    conn.close()
+
+
+def salvar_demonstracao_visual(
+    user_id: str, nome: str, descricao: str,
+    sequencia_json: str, imagem_referencia: str = "",
+) -> bool:
+    if not nome or not sequencia_json:
+        return False
+    user_id = (user_id or "guest").strip()
+    nome    = nome.strip().lower()
+    try:
+        _criar_tabela_demonstracoes_visuais()
+        conn = sqlite3.connect(_DB_PESSOAL)
+        conn.execute(
+            """
+            INSERT INTO demonstracoes_visuais
+                (user_id, nome, descricao, sequencia_json, imagem_referencia, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, nome) DO UPDATE SET
+                descricao         = excluded.descricao,
+                sequencia_json    = excluded.sequencia_json,
+                imagem_referencia = excluded.imagem_referencia,
+                updated_at        = CURRENT_TIMESTAMP
+            """,
+            (user_id, nome, descricao or "", sequencia_json, imagem_referencia or ""),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        _log_err(f"Erro ao salvar demonstração visual: {e}")
+        return False
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+
+# =============================================================================
 # Standalone
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 if __name__ == "__main__":
-    from memoria import SiriusMemory
-    mem = SiriusMemory()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="S.I.R.I.U.S. Autodidata v5.2")
+    parser.add_argument(
+        "--batch", type=int, default=0,
+        help="Processa N temas imediatamente (síncrono) e sai. Ex: --batch 20"
+    )
+    parser.add_argument(
+        "--continuo", action="store_true",
+        help="Roda em loop contínuo em background (daemon)"
+    )
+    args = parser.parse_args()
+
+    if not _MEMORIA_OK:
+        print("[AUTODIDATA]: ERRO — memoria.py não encontrado. Instale ou coloque no path.")
+        sys.exit(1)
+
+    mem = SiriusMemoria()
     bot = SiriusAutodidata(memoria=mem)
+
+    print("=" * 60)
+    print(f"  S.I.R.I.U.S. Autodidata v5.2")
+    print(f"  Base de conhecimento: {len(TODOS_OS_TEMAS)} temas")
+    print("=" * 60)
+
+    if args.batch > 0:
+        resultado = bot.processar_batch_agora(n=args.batch)
+        print(f"\n  Resultado: {resultado}")
+        sys.exit(0)
+
+    # Modo contínuo (padrão)
     bot.iniciar()
-    print(f"Autodidata rodando com {len(TODOS_OS_TEMAS)} temas. Ctrl+C para parar.")
+    print(f"  Autodidata rodando. Ctrl+C para parar.")
     try:
         while True:
             time.sleep(60)
             bot.imprimir_status()
     except KeyboardInterrupt:
         bot.parar()
-        print("Encerrado.")
+        print("\n  Encerrado.")

@@ -10,6 +10,7 @@ import winsound
 import numpy as np
 from faster_whisper import WhisperModel
 
+
 # --- LÓGICA DE CAMINHO ---
 caminho_src  = os.path.dirname(os.path.abspath(__file__))
 raiz_projeto = os.path.dirname(caminho_src)
@@ -22,7 +23,7 @@ try:
 except Exception as e:
     print(f"\033[31m[Erro]: Falha ao importar config: {e}\033[0m")
     ELEVENLABS_API_KEY = None
-    VOICE_ID = "TX3LPaxmHKxFdv7VOQHJ"
+    VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ")
 
 # Variantes fonéticas da wake word
 WAKE_WORD_VARIANTES = {
@@ -119,7 +120,7 @@ class SiriusAudio:
             pygame.mixer.init()
 
         # Flag de mute — bloqueia escuta enquanto Sirius fala
-        self._falando       = False
+        self._falando       = False   # acesso via self.falando (property thread-safe)
         self._lock_tts      = threading.Lock()
 
         # Flag de wake word — quando True, o próximo escutar_fluxo_continuo
@@ -140,6 +141,18 @@ class SiriusAudio:
                 print("\033[33m[AUDIO]: openwakeword nao instalado — wake word desabilitada.")
                 print("  Para ativar: pip install openwakeword\033[0m")
                 self._wakeword = None
+
+
+    # ── Acesso thread-safe à flag _falando ──────────────────────────────────
+
+    @property
+    def falando(self) -> bool:
+        with self._lock_tts:
+            return self._falando
+
+    def _set_falando(self, valor: bool):
+        with self._lock_tts:
+            self._falando = valor
 
     # -----------------------------------------------------------------------
     # Setup
@@ -174,7 +187,7 @@ class SiriusAudio:
         Callback chamado pelo SiriusWakeWord quando detecta a wake word.
         Sinaliza ao escutar_fluxo_continuo que o próximo áudio é um comando.
         """
-        if not self._falando:
+        if not self.falando:
             self._wake_ativada.set()
             print("\033[94m[AUDIO]: Wake word detectada — aguardando comando...\033[0m")
 
@@ -213,13 +226,13 @@ class SiriusAudio:
         print(f"\033[92m[SIRIUS]:\033[0m {texto_limpo}")
 
         # Cascata: ElevenLabs → Kokoro → pyttsx3
-        self._falando = True
+        self._set_falando(True)
         try:
             if not self._falar_elevenlabs(texto_limpo):
                 if not self._falar_kokoro(texto_limpo):
                     self._falar_windows(texto_limpo)
         finally:
-            self._falando = False
+            self._set_falando(False)
 
 
     def _falar_kokoro(self, texto: str) -> bool:
@@ -297,7 +310,7 @@ class SiriusAudio:
 
     def escutar_fluxo_continuo(self) -> str | None:
         # Não escuta enquanto o Sirius estiver falando
-        if self._falando:
+        if self.falando:
             time.sleep(0.1)
             return None
 
@@ -322,14 +335,14 @@ class SiriusAudio:
         try:
             with sr.Microphone() as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                if self._falando:
+                if self.falando:
                     return None
                 try:
                     audio = recognizer.listen(source, timeout=6, phrase_time_limit=10)
                 except sr.WaitTimeoutError:
                     return None
 
-            if self._falando:
+            if self.falando:
                 return None
 
             wav_data = audio.get_wav_data()
@@ -341,7 +354,7 @@ class SiriusAudio:
                 texto = "".join(s.text for s in segments).lower().strip()
             finally:
                 try: os.remove(tmp_path)
-                except: pass
+                except OSError: pass
 
             if not texto or _eh_transcricao_ruim(texto):
                 return None
@@ -370,14 +383,14 @@ class SiriusAudio:
         try:
             with sr.Microphone() as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.3)
-                if self._falando:
+                if self.falando:
                     return None
                 try:
                     audio = recognizer.listen(source, timeout=1, phrase_time_limit=8)
                 except sr.WaitTimeoutError:
                     return None
 
-            if self._falando:
+            if self.falando:
                 return None
 
             wav_data = audio.get_wav_data()
@@ -389,7 +402,7 @@ class SiriusAudio:
                 texto = "".join(s.text for s in segments).lower().strip()
             finally:
                 try: os.remove(tmp_path)
-                except: pass
+                except OSError: pass
 
             if not texto or _eh_transcricao_ruim(texto):
                 return None

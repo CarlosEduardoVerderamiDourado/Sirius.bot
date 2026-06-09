@@ -22,7 +22,7 @@ Uso no cerebro.py:
 
     # Acesso unificado
     self._sessao.nome_usuario        → "João" ou "chefia"
-    self._sessao.memoria             → SiriusMemory da conta ativa
+    self._sessao.memoria             → SiriusMemoria da conta ativa
     self._sessao.perfil              → SiriusPerfil da conta ativa
     self._sessao.processar(comando)  → trata comandos de conta/perfil/voz
 """
@@ -127,7 +127,7 @@ class SiriusSessao:
     def _recarregar_perfil_e_memoria(self):
         """Recarrega perfil e memória baseado na conta ativa."""
         from sirius_perfil import SiriusPerfil, PERFIL_PADRAO
-        from memoria import SiriusMemory
+        from memoria import SiriusMemoria
 
         conta = self._conta_ativa
         if conta:
@@ -137,13 +137,13 @@ class SiriusSessao:
 
             # Memória isolada por conta — banco SQLite separado
             db_path = os.path.join(CAMINHO_DATA, f"sirius_pessoal_{conta.slug}.db")
-            self._memoria = SiriusMemory(db_path=db_path)
+            self._memoria = SiriusMemoria(db_path=db_path)
 
             print(f"\033[92m[SESSAO]: Perfil de '{conta.nome}' carregado.\033[0m")
         else:
             # Sem contas — usa perfil e memória padrão
             self._perfil  = SiriusPerfil()
-            self._memoria = SiriusMemory()
+            self._memoria = SiriusMemoria()
 
     # -----------------------------------------------------------------------
     # Callbacks de eventos
@@ -231,7 +231,7 @@ class SiriusSessao:
 
     @property
     def memoria(self):
-        """SiriusMemory da conta ativa."""
+        """SiriusMemoria da conta ativa."""
         return self._memoria
 
     @property

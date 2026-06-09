@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000A12">
+<title>S.I.R.I.U.S.</title>
+<style>
+/* ─── Reset ──────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; }
+body {
+  background: #000A12;
+  color: #5DE2FF;
+  font-family: 'Consolas', 'Courier New', monospace;
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── Header ─────────────────────────────────────────────────────────────── */
+#header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 15px;
+  border-bottom: 1px solid #1a3a4a;
+  background: rgba(0,12,25,0.97);
+  flex-shrink: 0;
+  min-height: 46px;
+}
+#header-left  { display: flex; align-items: center; gap: 9px; }
+#header-right { display: flex; align-items: center; gap: 8px; }
+
+#dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #5DE2FF;
+  box-shadow: 0 0 7px #5DE2FF66;
+  transition: background .4s, box-shadow .4s;
+}
+#titulo {
+  font-size: 13px;
+  font-weight: bold;
+  letter-spacing: 4px;
+  color: #5DE2FF;
+}
+#estado-tag {
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: #5DE2FF;
+  transition: color .3s;
+}
+.btn-ico {
+  background: transparent;
+  border: none;
+  color: rgba(93,226,255,.3);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  transition: color .2s;
+  line-height: 1;
+}
+.btn-ico:hover { color: rgba(93,226,255,.7); }
+#btn-tts.ativo { color: #5DE2FF !important; }
+
+/* ─── Status bar ─────────────────────────────────────────────────────────── */
+#status-bar {
+  display: none;
+  gap: 14px;
+  padding: 4px 15px;
+  font-size: 11px;
+  color: rgba(93,226,255,.4);
+  background: rgba(0,7,15,.9);
+  border-bottom: 1px solid #1a3a4a;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: center;
+}
+#status-bar.show { display: flex; }
+.sb-warn { color: #FFD700 !important; }
+#sb-conta { color: #00FF88; }
+
+/* ─── Banner offline ─────────────────────────────────────────────────────── */
+#banner {
+  display: none;
+  background: rgba(255,100,0,.07);
+  border-bottom: 1px solid rgba(255,150,0,.2);
+  color: #FFD700;
+  font-size: 12px;
+  padding: 5px 15px;
+  flex-shrink: 0;
+  text-align: center;
+}
+#banner.show { display: block; }
+#btn-retry {
+  color: #FFD700;
+  cursor: pointer;
+  background: none;
+  border: none;
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+}
+
+/* ─── Tela de configuração ───────────────────────────────────────────────── */
+#tela-cfg {
+  display: none;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  overflow-y: auto;
+}
+#tela-cfg.show { display: flex; }
+.cfg-box {
+  background: rgba(0,8,18,.99);
+  border: 1px solid #5DE2FF;
+  border-radius: 13px;
+  padding: 28px 22px;
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cfg-logo  { font-size: 15px; font-weight: bold; letter-spacing: 4px; color: #5DE2FF; text-align: center; margin-bottom: 4px; }
+.cfg-label { font-size: 10px; color: rgba(93,226,255,.4); letter-spacing: 2px; }
+.cfg-dica  { font-size: 11px; color: rgba(93,226,255,.33); line-height: 1.65; }
+.cfg-dica b { color: #5DE2FF; font-weight: normal; }
+.cfg-input {
+  background: rgba(93,226,255,.04);
+  border: 1px solid rgba(93,226,255,.28);
+  border-radius: 7px;
+  color: #fff;
+  padding: 11px 13px;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+  width: 100%;
+  -webkit-appearance: none;
+  transition: border-color .2s;
+}
+.cfg-input:focus { border-color: rgba(93,226,255,.6); }
+.cfg-input::placeholder { color: rgba(93,226,255,.2); }
+.btn-primario {
+  background: rgba(93,226,255,.09);
+  border: 1px solid #5DE2FF;
+  border-radius: 7px;
+  color: #5DE2FF;
+  padding: 11px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: bold;
+  letter-spacing: 2px;
+  cursor: pointer;
+  width: 100%;
+  transition: background .2s;
+}
+.btn-primario:hover { background: rgba(93,226,255,.18); }
+.btn-secundario {
+  background: transparent;
+  border: none;
+  color: rgba(93,226,255,.28);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  text-align: center;
+  padding: 4px;
+}
+.cfg-rodape {
+  font-size: 10px;
+  color: rgba(93,226,255,.2);
+  text-align: center;
+  line-height: 1.7;
+  border-top: 1px solid rgba(93,226,255,.1);
+  padding-top: 10px;
+}
+
+/* ─── Chat ───────────────────────────────────────────────────────────────── */
+#chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-height: 0;
+  -webkit-overflow-scrolling: touch;
+}
+#chat::-webkit-scrollbar { width: 3px; }
+#chat::-webkit-scrollbar-thumb { background: rgba(93,226,255,.15); border-radius: 2px; }
+
+#chat-vazio {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  padding: 40px 0;
+}
+#chat-vazio .vazio-icon  { font-size: 38px; opacity: .15; margin-bottom: 10px; }
+#chat-vazio .vazio-label { opacity: .28; font-size: 12px; }
+#chat-vazio.oculto { display: none; }
+
+.msg {
+  max-width: 83%;
+  padding: 9px 13px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.58;
+  word-break: break-word;
+  animation: msg-in .2s ease;
+}
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.msg-usuario {
+  align-self: flex-end;
+  background: rgba(93,226,255,.09);
+  border: 1px solid rgba(93,226,255,.22);
+  color: #fff;
+}
+.msg-sirius {
+  align-self: flex-start;
+  background: rgba(0,22,40,.88);
+  border: 1px solid #1a3a4a;
+  color: #5DE2FF;
+}
+.msg-sistema {
+  align-self: center;
+  background: none;
+  border: none;
+  color: rgba(93,226,255,.28);
+  font-size: 11px;
+  padding: 2px 0;
+  max-width: 100%;
+  text-align: center;
+}
+.msg-tag  { color: #5DE2FF; font-weight: bold; font-size: 10px; margin-bottom: 3px; letter-spacing: 1px; }
+.msg-hora { font-size: 10px; opacity: .27; margin-top: 4px; text-align: right; }
+
+/* Typing indicator */
+#digitando {
+  display: none;
+  align-self: flex-start;
+  background: rgba(0,22,40,.88);
+  border: 1px solid #1a3a4a;
+  color: #5DE2FF;
+  padding: 9px 13px;
+  border-radius: 10px;
+  opacity: .55;
+  font-size: 13px;
+}
+#digitando.show { display: block; }
+#digitando .d-tag  { color: #5DE2FF; font-weight: bold; font-size: 10px; margin-bottom: 3px; letter-spacing: 1px; }
+#digitando .d-dots { letter-spacing: 3px; font-size: 16px; }
+
+/* ─── Input area ─────────────────────────────────────────────────────────── */
+#input-area {
+  padding: 10px 14px;
+  border-top: 1px solid #1a3a4a;
+  display: flex;
+  gap: 8px;
+  background: rgba(0,10,20,.97);
+  flex-shrink: 0;
+}
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  #input-area { padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+}
+#msg-input {
+  flex: 1;
+  background: rgba(93,226,255,.04);
+  border: 1px solid rgba(93,226,255,.22);
+  border-radius: 8px;
+  color: #fff;
+  padding: 9px 13px;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  min-width: 0;
+  transition: border-color .2s;
+  -webkit-appearance: none;
+}
+#msg-input:focus { border-color: rgba(93,226,255,.55); }
+#msg-input::placeholder { color: rgba(93,226,255,.22); }
+#msg-input:disabled { opacity: .5; }
+
+#btn-enviar {
+  background: rgba(93,226,255,.09);
+  border: 1px solid #5DE2FF;
+  border-radius: 8px;
+  color: #5DE2FF;
+  padding: 0 16px;
+  font-size: 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+  font-family: inherit;
+  transition: background .2s, opacity .2s;
+  white-space: nowrap;
+}
+#btn-enviar:disabled { opacity: .35; cursor: not-allowed; }
+#btn-enviar:not(:disabled):hover { background: rgba(93,226,255,.18); }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <div id="header-left">
+    <div id="dot"></div>
+    <span id="titulo">S.I.R.I.U.S.</span>
+  </div>
+  <div id="header-right">
+    <span id="estado-tag">standby</span>
+    <button class="btn-ico" id="btn-tts"    title="Alternar voz">🔊</button>
+    <button class="btn-ico" id="btn-config" title="Configurar">⚙</button>
+  </div>
+</div>
+
+<!-- Status Bar -->
+<div id="status-bar">
+  <span id="sb-cpu"></span>
+  <span id="sb-ram"></span>
+  <span id="sb-conta"></span>
+  <span id="sb-sep" style="opacity:.25">|</span>
+  <span id="sb-url" style="opacity:.5"></span>
+  <span id="sb-clientes" style="opacity:.35"></span>
+</div>
+
+<!-- Banner offline -->
+<div id="banner">
+  ⚠ Sem conexão ·
+  <span id="banner-tent"></span> ·
+  <button id="btn-retry">tentar agora</button>
+</div>
+
+<!-- Tela de configuração -->
+<div id="tela-cfg">
+  <div class="cfg-box">
+    <div class="cfg-logo">◆ S.I.R.I.U.S.</div>
+    <div class="cfg-label">ENDEREÇO DO SERVIDOR</div>
+    <div class="cfg-dica">
+      Ex: <b>192.168.1.10:5000</b><br>
+      Aparece no terminal do PC ao iniciar o Sirius.
+    </div>
+    <input class="cfg-input" id="cfg-url-input"
+           placeholder="192.168.1.10:5000"
+           autocomplete="off" autocorrect="off"
+           autocapitalize="none" spellcheck="false">
+    <button class="btn-primario" id="btn-salvar">CONECTAR</button>
+    <button class="btn-secundario" id="btn-cancelar">Cancelar</button>
+    <div class="cfg-rodape">
+      Memória · Processamento · Aprendizado<br>
+      executam no PC do servidor
+    </div>
+  </div>
+</div>
+
+<!-- Chat -->
+<div id="chat">
+  <div id="chat-vazio">
+    <div class="vazio-icon">◆</div>
+    <div class="vazio-label" id="vazio-label">Conectando...</div>
+  </div>
+  <div id="digitando">
+    <div class="d-tag">◆ SIRIUS</div>
+    <div class="d-dots">• • •</div>
+  </div>
+</div>
+
+<!-- Input -->
+<div id="input-area">
+  <input id="msg-input"
+         placeholder="Comando ou pergunta..."
+         autocomplete="off" autocorrect="off"
+         autocapitalize="sentences" spellcheck="false"
+         maxlength="2000">
+  <button id="btn-enviar" disabled>▶</button>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   S.I.R.I.U.S. — Vanilla JS
+   Conversão fiel do SiriusApp.jsx (React) para HTML/JS puro.
+   ════════════════════════════════════════════════════════════════════════════ */
+'use strict';
+
+// ─── Constantes ──────────────────────────────────────────────────────────── //
+const K_URL       = 'sirius_url';
+const K_TTS       = 'sirius_tts';
+const K_USER      = 'sirius_user_id';
+const K_DEVICE    = 'sirius_device_name';
+const K_DEVICE_ID = 'sirius_device_id';
+const MAX_INPUT   = 2000;
+const MAX_MSGS    = 50;
+
+const ESTADOS = {
+  STANDBY:     { cor: '#5DE2FF', label: 'standby'     },
+  OUVINDO:     { cor: '#00FF88', label: 'ouvindo'     },
+  PROCESSANDO: { cor: '#FFD700', label: 'processando' },
+  FALANDO:     { cor: '#FFFFFF', label: 'falando'     },
+};
+
+// ─── localStorage helpers ────────────────────────────────────────────────── //
+function lsGet(k, def)  { const v = localStorage.getItem(k); return v !== null ? v : (def ?? ''); }
+function lsSet(k, v)    { localStorage.setItem(k, String(v)); }
+function lsBool(k, def) { const v = localStorage.getItem(k); return v === null ? (def ?? true) : v !== 'false'; }
+
+// ─── Sanitizadores (idênticos ao JSX) ───────────────────────────────────── //
+function sanitizeServerUrl(v) {
+  return String(v || '').trim()
+    .replace(/^https?:\/\//, '').replace(/^wss?:\/\//, '').replace(/\/$/, '');
+}
+function sanitizeUserInput(v) {
+  return String(v || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    .trim().slice(0, MAX_INPUT);
+}
+function normalizeDeviceId(text) {
+  return String(text || '').normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '').toLowerCase().trim()
+    .replace(/\s+/g, '_').replace(/[^a-z0-9_-]/g, '') || 'device';
+}
+
+// ─── Device info ─────────────────────────────────────────────────────────── //
+function getDeviceName() { return lsGet(K_DEVICE, navigator.platform || 'navegador'); }
+function getUserId()     { return lsGet(K_USER, 'guest'); }
+function getDeviceInfo() {
+  const deviceName = getDeviceName();
+  let deviceId = lsGet(K_DEVICE_ID);
+  if (!deviceId) { deviceId = normalizeDeviceId(deviceName); lsSet(K_DEVICE_ID, deviceId); }
+  return { deviceId, deviceName };
+}
+
+// ─── TTS ─────────────────────────────────────────────────────────────────── //
+if (window.speechSynthesis) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
+function falarLocal(texto) {
+  if (!lsBool(K_TTS, true) || !window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(String(texto || ''));
+  u.lang = 'pt-BR'; u.rate = 1.05;
+  const ptVoz = window.speechSynthesis.getVoices().find(v => v.lang.startsWith('pt'));
+  if (ptVoz) u.voice = ptVoz;
+  window.speechSynthesis.speak(u);
+}
+
+// ─── Estado global ───────────────────────────────────────────────────────── //
+const app = {
+  url:         lsGet(K_URL),
+  tts:         lsBool(K_TTS, true),
+  conectado:   false,
+  estado:      'STANDBY',
+  tentativas:  0,
+  isLoading:   false,
+  msgCount:    0,
+  ws:          null,
+  timerReconn: null,
+  timerHb:     null,
+  timerStatus: null,
+};
+
+// ─── DOM refs ────────────────────────────────────────────────────────────── //
+const $ = id => document.getElementById(id);
+const el = {
+  dot:         $('dot'),
+  estadoTag:   $('estado-tag'),
+  statusBar:   $('status-bar'),
+  sbCpu:       $('sb-cpu'),
+  sbRam:       $('sb-ram'),
+  sbConta:     $('sb-conta'),
+  sbSep:       $('sb-sep'),
+  sbUrl:       $('sb-url'),
+  sbClientes:  $('sb-clientes'),
+  banner:      $('banner'),
+  bannerTent:  $('banner-tent'),
+  btnRetry:    $('btn-retry'),
+  telaCfg:     $('tela-cfg'),
+  cfgInput:    $('cfg-url-input'),
+  btnSalvar:   $('btn-salvar'),
+  btnCancelar: $('btn-cancelar'),
+  chat:        $('chat'),
+  chatVazio:   $('chat-vazio'),
+  vazioLabel:  $('vazio-label'),
+  digitando:   $('digitando'),
+  inputArea:   $('input-area'),
+  msgInput:    $('msg-input'),
+  btnEnviar:   $('btn-enviar'),
+  btnTTS:      $('btn-tts'),
+  btnConfig:   $('btn-config'),
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// UI helpers
+// ════════════════════════════════════════════════════════════════════════════
+
+function fmtHora(ts) {
+  try { return new Date(ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); }
+  catch { return ''; }
+}
+
+function setEstado(est) {
+  app.estado = est;
+  const { cor, label } = ESTADOS[est] || ESTADOS.STANDBY;
+  el.dot.style.background  = cor;
+  el.dot.style.boxShadow   = `0 0 7px ${cor}66`;
+  el.estadoTag.style.color = cor;
+  el.estadoTag.textContent = label;
+}
+
+function setConectado(ok) {
+  app.conectado = ok;
+  el.banner.classList.toggle('show', !ok);
+  if (ok) {
+    el.bannerTent.textContent = '';
+    el.vazioLabel.textContent = 'Aguardando comandos...';
+  } else {
+    el.statusBar.classList.remove('show');
+  }
+}
+
+function setLoading(v) {
+  app.isLoading      = v;
+  el.msgInput.disabled = v;
+  atualizarBtnEnviar();
+  el.digitando.classList.toggle('show', v);
+  atualizarVazio();
+}
+
+function atualizarBtnEnviar() {
+  el.btnEnviar.disabled = app.isLoading || sanitizeUserInput(el.msgInput.value).length === 0;
+}
+
+function atualizarVazio() {
+  const temConteudo = el.chat.querySelectorAll('.msg').length > 0
+                   || el.digitando.classList.contains('show');
+  el.chatVazio.classList.toggle('oculto', temConteudo);
+}
+
+// ─── Status bar ───────────────────────────────────────────────────────────── //
+function renderStatus(d) {
+  if (!d || !app.conectado) return;
+  let show = false;
+
+  el.sbCpu.textContent     = '';
+  el.sbRam.textContent     = '';
+  el.sbConta.textContent   = '';
+  el.sbClientes.textContent = '';
+
+  if (d.cpu_pct != null) {
+    el.sbCpu.textContent = `CPU ${d.cpu_pct}%`;
+    el.sbCpu.classList.toggle('sb-warn', d.cpu_pct > 80);
+    show = true;
+  }
+  if (d.ram_pct != null) {
+    el.sbRam.textContent = `RAM ${d.ram_pct}%`;
+    el.sbRam.classList.toggle('sb-warn', d.ram_pct > 85);
+    show = true;
+  }
+  if (d.conta) {
+    el.sbConta.textContent = `● ${d.conta}`;
+    show = true;
+  }
+  el.sbUrl.textContent = app.url;
+  if (d.ws_clientes > 1) el.sbClientes.textContent = `${d.ws_clientes} clientes`;
+  el.statusBar.classList.toggle('show', show);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Mensagens
+// ════════════════════════════════════════════════════════════════════════════
+
+function addMsg(tipo, texto, ts) {
+  const safe = String(texto || '').trim();
+  if (!safe) return;
+
+  // Limite de histórico (como no JSX — MAX_MSGS)
+  const msgs = el.chat.querySelectorAll('.msg');
+  if (msgs.length >= MAX_MSGS) msgs[0].remove();
+
+  const div = document.createElement('div');
+  div.className = 'msg msg-' + tipo;
+  div.dataset.id = ++app.msgCount;
+
+  if (tipo === 'sirius') {
+    const tag = document.createElement('div');
+    tag.className   = 'msg-tag';
+    tag.textContent = '◆ SIRIUS';
+    div.appendChild(tag);
+  }
+
+  // Conteúdo com quebras de linha preservadas
+  const corpo = document.createElement('div');
+  safe.split('\n').forEach((linha, i, arr) => {
+    corpo.appendChild(document.createTextNode(linha));
+    if (i < arr.length - 1) corpo.appendChild(document.createElement('br'));
+  });
+  div.appendChild(corpo);
+
+  if (tipo !== 'sistema') {
+    const hora = document.createElement('div');
+    hora.className   = 'msg-hora';
+    hora.textContent = fmtHora(ts || new Date().toISOString());
+    div.appendChild(hora);
+  }
+
+  el.chat.insertBefore(div, el.digitando);
+  el.chat.scrollTop = el.chat.scrollHeight;
+  atualizarVazio();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// WebSocket
+// ════════════════════════════════════════════════════════════════════════════
+
+function conectar(serverUrl) {
+  const host = sanitizeServerUrl(serverUrl);
+  if (!host) { addMsg('sistema', '✗ Endereço do servidor inválido.'); return; }
+
+  limparTimers();
+  if (app.ws) { app.ws.onclose = null; try { app.ws.close(); } catch(_){} app.ws = null; }
+
+  let ws;
+  try { ws = new WebSocket(`ws://${host}/ws`); }
+  catch { addMsg('sistema', `✗ URL inválida: ws://${host}/ws`); return; }
+  app.ws = ws;
+
+  // onopen ─────────────────────────────────────────────────────────────── //
+  ws.onopen = () => {
+    app.tentativas = 0;
+    setConectado(true);
+    setEstado('STANDBY');
+    setLoading(false);
+    addMsg('sistema', `✓ Conectado — ${host}`);
+
+    const userId = getUserId();
+    const { deviceId, deviceName } = getDeviceInfo();
+    lsSet(K_USER, userId); lsSet(K_DEVICE, deviceName);
+    wsSend({ user_id: userId, device_id: deviceId, device_name: deviceName });
+
+    enviarHeartbeat();
+    iniciarHeartbeat();
+    fetchStatus(host);
+    iniciarStatusPolling(host);
+  };
+
+  // onmessage ──────────────────────────────────────────────────────────── //
+  ws.onmessage = ({ data }) => {
+    let d;
+    try { d = JSON.parse(data); } catch { addMsg('sirius', data); return; }
+    const { tipo, texto, estado: est, mensagem, timestamp } = d;
+
+    if (tipo === 'sirius' || tipo === 'proativo') {
+      setLoading(false);
+      setEstado('STANDBY');
+      addMsg('sirius', texto, timestamp);
+      falarLocal(texto);
+
+    } else if (tipo === 'bem_vindo') {
+      addMsg('sistema', mensagem || 'Conectado ao Sirius.');
+      if (est) setEstado(est);
+
+    } else if (tipo === 'estado') {
+      const novoEst = est || 'STANDBY';
+      setEstado(novoEst);
+      const processando = novoEst === 'PROCESSANDO';
+      el.digitando.classList.toggle('show', processando);
+      atualizarVazio();
+      if (novoEst === 'FALANDO' && texto) falarLocal(texto);
+      if (novoEst === 'STANDBY' || novoEst === 'OUVINDO') setLoading(false);
+
+    } else if (tipo === 'log') {
+      console.log('[SIRIUS]', texto);
+    }
+  };
+
+  // onclose ────────────────────────────────────────────────────────────── //
+  ws.onclose = () => {
+    limparTimers();
+    setConectado(false);
+    setEstado('STANDBY');
+    setLoading(false);
+
+    app.tentativas++;
+    el.bannerTent.textContent = `tentativa ${app.tentativas}`;
+
+    // Backoff exponencial: 2s → 4s → 8s → 16s → 30s máx
+    const delay = Math.min(2000 * Math.pow(2, Math.min(app.tentativas - 1, 4)), 30000);
+    app.timerReconn = setTimeout(() => conectar(serverUrl), delay);
+  };
+
+  // onerror ────────────────────────────────────────────────────────────── //
+  ws.onerror = () => setLoading(false);
+}
+
+function wsSend(obj) {
+  if (app.ws && app.ws.readyState === WebSocket.OPEN) {
+    try { app.ws.send(JSON.stringify(obj)); } catch(e) { console.warn('[WS send]', e); }
+  }
+}
+
+// ─── Heartbeat (20s) ─────────────────────────────────────────────────────── //
+function enviarHeartbeat() {
+  const { deviceId, deviceName } = getDeviceInfo();
+  wsSend({ tipo: 'heartbeat', device_id: deviceId, device_name: deviceName, has_focus: document.hasFocus() });
+}
+function iniciarHeartbeat() {
+  clearInterval(app.timerHb);
+  app.timerHb = setInterval(enviarHeartbeat, 20000);
+  const hb = () => enviarHeartbeat();
+  window.addEventListener('visibilitychange', hb);
+  window.addEventListener('focus', hb);
+  window.addEventListener('blur',  hb);
+}
+
+// ─── Status REST (15s) ───────────────────────────────────────────────────── //
+function fetchStatus(host) {
+  fetch(`http://${host}/status`, { signal: AbortSignal.timeout(8000) })
+    .then(r => r.ok ? r.json() : null)
+    .then(d => { if (d) renderStatus(d); })
+    .catch(() => {});
+}
+function iniciarStatusPolling(host) {
+  clearInterval(app.timerStatus);
+  app.timerStatus = setInterval(() => fetchStatus(host), 15000);
+}
+
+function limparTimers() {
+  clearTimeout(app.timerReconn);
+  clearInterval(app.timerHb);
+  clearInterval(app.timerStatus);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Envio de mensagem
+// ════════════════════════════════════════════════════════════════════════════
+
+async function enviar() {
+  const txt = sanitizeUserInput(el.msgInput.value);
+  if (!txt || app.isLoading) return;
+
+  addMsg('usuario', txt);
+  el.msgInput.value = '';
+  atualizarBtnEnviar();
+
+  // Via WebSocket (preferencial)
+  if (app.ws && app.ws.readyState === WebSocket.OPEN) {
+    setLoading(true);
+    try { app.ws.send(JSON.stringify({ texto: txt })); }
+    catch { setLoading(false); addMsg('sistema', '✗ Erro de envio. A mensagem permanece no chat.'); }
+    return;
+  }
+
+  // Fallback REST POST /comando
+  const host = sanitizeServerUrl(app.url);
+  if (!host) { addMsg('sistema', '✗ Endereço do servidor inválido.'); return; }
+
+  setLoading(true);
+  try {
+    const res = await fetch(`http://${host}/comando`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ texto: txt }),
+      signal:  AbortSignal.timeout(30000),
+    });
+    if (!res.ok) throw new Error('erro de rede');
+    const data = await res.json();
+    if (data?.resposta) { addMsg('sirius', data.resposta); falarLocal(data.resposta); }
+    else addMsg('sistema', '✗ Servidor respondeu sem conteúdo válido.');
+  } catch {
+    addMsg('sistema', 'Servidor offline ou erro de rede. A mensagem permanece no chat.');
+  } finally {
+    setLoading(false);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Configuração
+// ════════════════════════════════════════════════════════════════════════════
+
+function abrirCfg() {
+  el.cfgInput.value = app.url || '';
+  el.telaCfg.classList.add('show');
+  el.chat.style.display     = 'none';
+  el.inputArea.style.display = 'none';
+  setTimeout(() => el.cfgInput.focus(), 60);
+}
+
+function fecharCfg() {
+  if (!app.url) return;   // sem URL salva não pode fechar
+  el.telaCfg.classList.remove('show');
+  el.chat.style.display     = '';
+  el.inputArea.style.display = '';
+}
+
+function salvarCfg() {
+  const u = sanitizeServerUrl(el.cfgInput.value);
+  if (!u) { el.cfgInput.focus(); return; }
+
+  lsSet(K_URL, u);
+  app.url = u;
+
+  // Limpa chat (como no JSX: setMsgs([]))
+  el.chat.querySelectorAll('.msg').forEach(m => m.remove());
+  el.digitando.classList.remove('show');
+  atualizarVazio();
+
+  fecharCfg();
+  conectar(u);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// TTS toggle
+// ════════════════════════════════════════════════════════════════════════════
+
+function toggleTTS() {
+  app.tts = !app.tts;
+  lsSet(K_TTS, String(app.tts));
+  el.btnTTS.classList.toggle('ativo', app.tts);
+  if (!app.tts) window.speechSynthesis?.cancel();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Events
+// ════════════════════════════════════════════════════════════════════════════
+
+el.btnConfig.addEventListener('click', abrirCfg);
+el.btnTTS.addEventListener('click', toggleTTS);
+el.btnSalvar.addEventListener('click', salvarCfg);
+el.btnCancelar.addEventListener('click', fecharCfg);
+el.cfgInput.addEventListener('keydown', e => { if (e.key === 'Enter') salvarCfg(); });
+
+el.btnEnviar.addEventListener('click', enviar);
+el.msgInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); enviar(); }
+});
+el.msgInput.addEventListener('input', atualizarBtnEnviar);
+
+el.btnRetry.addEventListener('click', () => {
+  clearTimeout(app.timerReconn);
+  app.tentativas = 0;
+  conectar(app.url);
+});
+
+// Previne zoom duplo-toque iOS sem desabilitar scroll
+document.addEventListener('dblclick', e => e.preventDefault(), { passive: false });
+
+// ════════════════════════════════════════════════════════════════════════════
+// Boot
+// ════════════════════════════════════════════════════════════════════════════
+
+(function boot() {
+  // Estado inicial TTS
+  el.btnTTS.classList.toggle('ativo', app.tts);
+
+  if (!app.url) {
+    // Sem URL → tela de configuração (sem botão Cancelar)
+    el.chat.style.display      = 'none';
+    el.inputArea.style.display = 'none';
+    el.telaCfg.classList.add('show');
+    el.btnCancelar.style.display = 'none';
+  } else {
+    setEstado('STANDBY');
+    el.vazioLabel.textContent = 'Conectando...';
+    conectar(app.url);
+  }
+})();
+</script>
+</body>
+</html>python src/main_residente.py

@@ -2,7 +2,7 @@
 sirius_nucleo.py — Núcleo leve do S.I.R.I.U.S. para o servidor
 
 Carrega APENAS os três sistemas essenciais:
-  - SiriusMemory    → histórico de conversas, dúvidas, macros
+  - SiriusMemoria    → histórico de conversas, dúvidas, macros
   - SiriusNeuronio  → classificador neural + predição de intenção
   - Aprendizado     → SiriusAutodidata (Wikipedia + DDG) e SiriusTreinador
 
@@ -37,8 +37,8 @@ class SiriusNucleo:
     def __init__(self, db_pessoal: str = None):
         print("\033[94m[NUCLEO]: Inicializando núcleo leve...\033[0m")
 
-        from memoria import SiriusMemory
-        self.memoria  = SiriusMemory(db_pessoal=db_pessoal)
+        from memoria import SiriusMemoria
+        self.memoria  = SiriusMemoria(db_pessoal=db_pessoal)
         print("\033[92m[NUCLEO]: Memória ativa.\033[0m")
 
         from neuronio import SiriusNeuronio

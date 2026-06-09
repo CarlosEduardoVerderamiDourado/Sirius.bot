@@ -70,6 +70,14 @@ except Exception:
     LOGO_SIRIUS_B64 = None
     print("[AVISO]: Logo não encontrada em config/config.py")
 
+# Gatilhos de e-mail (startup + texto livre)
+try:
+    from sirius_mail_gatilhos import SiriusMailGatilhos
+    _MAIL_GATILHOS_DISPONIVEL = True
+except ImportError:
+    _MAIL_GATILHOS_DISPONIVEL = False
+    print("[AVISO]: sirius_mail_gatilhos.py não encontrado — gatilhos de e-mail desabilitados.")
+
 
 # ---------------------------------------------------------------------------
 # APRENDIZADO AUTÔNOMO EM BACKGROUND (fallback legado)
@@ -140,6 +148,20 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
 
         self._iniciar_aprendizado_autonomo()
         self._iniciar_treinador_autonomo()
+
+        # Gatilhos de e-mail — inicializa e dispara verificação de startup
+        self._mail = None
+        if _MAIL_GATILHOS_DISPONIVEL:
+            try:
+                self._mail = SiriusMailGatilhos(
+                    cerebro=self.cerebro,
+                    ui=self,
+                    user_id="carlos",
+                )
+                self._mail.gatilho_startup(atraso_segundos=5.0)
+                print("[MAIN]: SiriusMailGatilhos iniciado — verificação de startup agendada.")
+            except Exception as e:
+                print(f"[MAIN]: Falha ao iniciar SiriusMailGatilhos: {e}")
 
         self.icone_sirius = self._obter_icone_sirius()
         self.setWindowIcon(self.icone_sirius)
@@ -256,6 +278,10 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
         self.input_texto.clear()
         self.log_usuario(texto_original)
 
+        # ── GATILHO 2: texto sobre e-mail → intercepta antes do cérebro ──
+        if self._mail and self._mail.interceptar_texto(texto_original):
+            return   # gatilho tratou, não passa para o cérebro
+
         # Garante wake word para que o cérebro processe corretamente
         if "sirius" not in texto_original.lower():
             texto_para_processar = f"Sirius, {texto_original}"
@@ -293,12 +319,26 @@ class SiriusAppPrincipal(SiriusInterfaceMainWindow):
             )
 
     def sair_total(self):
-        """Encerra completamente a aplicação."""
-        self.ativo = False
-        self.worker.rodando = False  # Para o SiriusWorker corretamente
+        """Encerra completamente a aplicação com cleanup gracioso."""
+        self.ativo          = False
+        self.worker.rodando = False   # sinaliza o SiriusWorker para parar
+
+        # Aguarda o worker terminar (máx 3s) antes de fechar a UI
+        try:
+            self.worker.wait(3000)    # QThread.wait(ms)
+        except Exception:
+            pass
+
+        # Salva estado antes de sair
+        try:
+            if hasattr(self.cerebro, 'salvar_estado'):
+                self.cerebro.salvar_estado("ultimo_modo", "janela")
+        except Exception:
+            pass
+
         self.tray.hide()
         QApplication.quit()
-        os._exit(0)
+        # os._exit(0) removido — deixa o Python executar finally/atexit normalmente
 
 
 # ---------------------------------------------------------------------------

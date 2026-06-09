@@ -21,7 +21,7 @@ from collections import deque
 from functools import lru_cache
 
 
-class SiriusMemory:
+class SiriusMemoria:
     def __init__(self, db_pessoal: str = None, db_path: str = None):
         """
         db_pessoal / db_path: caminho do banco pessoal (aliases aceitos).
@@ -616,3 +616,8 @@ class SiriusMemory:
                 pass
         self._async(_write)
         return True
+
+# =============================================================================
+# Alias de compatibilidade — cerebro.py e demais módulos usam SiriusMemoria
+# =============================================================================
+SiriusMemoria

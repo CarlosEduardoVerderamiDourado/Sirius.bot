@@ -31,8 +31,8 @@ from pathlib import Path
 import inspect
 
 try:
-    from RestrictedPython import compile_restricted_exec, safe_globals
-    RESTRICTEDPYTHON_DISPONIVEL = True
+   from RestrictedPython import compile_restricted_exec, safe_globals
+   RESTRICTEDPYTHON_DISPONIVEL = True
 except ImportError:
     RESTRICTEDPYTHON_DISPONIVEL = False
 
@@ -145,7 +145,7 @@ class SiriusExecutor:
         Inicializa executor.
         
         Args:
-            memoria: instancia de SiriusMemory
+            memoria: instancia de SiriusMemoria
             user_id: id do usuario (LGPD)
         """
         self.memoria = memoria

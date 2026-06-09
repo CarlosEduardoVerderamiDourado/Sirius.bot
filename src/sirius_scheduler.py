@@ -107,21 +107,29 @@ class SiriusScheduler:
     # -----------------------------------------------------------------------
 
     def _pausar_aprendizado(self):
-        """Pausa o coordenador/autodidata durante conversa ativa."""
-        # O autodidata tem sleep de 5min — não precisamos forçar parada,
-        # apenas sinalizamos para ele não processar na próxima iteração
+        """
+        Pausa o autodidata durante conversa ativa.
+        Usa setattr defensivo — funciona mesmo se _pausado não foi inicializado
+        (ex: versão antiga do sirius_autodidata.py sem o atributo).
+        """
         if self._coordenador and hasattr(self._coordenador, '_autodidata'):
             ad = self._coordenador._autodidata
-            if ad:
-                # Injeta um flag de pausa sem matar a thread
+            if ad is not None:
+                # Garante que o atributo existe antes de setar
+                if not hasattr(ad, '_pausado'):
+                    ad._pausado = False   # inicializa se vier de versão antiga
                 ad._pausado = True
+                print("\033[90m[SCHEDULER]: Autodidata pausado.\033[0m")
 
     def _retomar_aprendizado(self):
         """Retoma o aprendizado quando entra em standby."""
         if self._coordenador and hasattr(self._coordenador, '_autodidata'):
             ad = self._coordenador._autodidata
-            if ad:
+            if ad is not None:
+                if not hasattr(ad, '_pausado'):
+                    ad._pausado = False
                 ad._pausado = False
+                print("\033[90m[SCHEDULER]: Autodidata retomado.\033[0m")
 
     def _executar_treino_standby(self):
         """Executa treino completo durante standby se tiver dados."""

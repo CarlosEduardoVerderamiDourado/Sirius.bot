@@ -3,7 +3,7 @@ sirius_mail.py - Gerenciador de E-mail Inteligente com LangGraph
 
 Implementa acesso IMAP a e-mails com:
 - Leitura de últimos 3 e-mails não lidos
-- Resumo inteligente usando SiriusMemory
+- Resumo inteligente usando SiriusMemoria
 - Detecta prioridade baseada em histórico
 - Auditoria completa para conformidade
 - Tool factory para LangGraph agents
@@ -21,19 +21,16 @@ import re
 import email
 import imaplib
 import threading
+import socket
 import time
 from datetime import datetime, timedelta
+
+# Timeout global de 10s para evitar Blocking I/O em operações IMAP
+socket.setdefaulttimeout(10)
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from email.header import decode_header
 from email.mime.text import MIMEText
-
-# Load environment variables
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 diretorio_src = os.path.dirname(os.path.abspath(__file__))
 diretorio_raiz = os.path.dirname(diretorio_src)
@@ -46,6 +43,209 @@ os.makedirs(CAMINHO_DATA, exist_ok=True)
 DB_PESSOAL = os.path.join(CAMINHO_DATA, "sirius_pessoal.db")
 
 
+def _encontrar_env() -> Optional[Path]:
+    """
+    Procura o arquivo .env com a seguinte ordem de prioridade:
+
+      1. <raiz_do_projeto>/config/.env   <- localização padrão do Sirius
+      2. <raiz_do_projeto>/.env          <- fallback na raiz
+      3. src/.env                        <- fallback no mesmo diretório do arquivo
+      4. Sobe a árvore até a raiz do sistema como último recurso
+
+    Estrutura esperada do projeto:
+        projeto/
+        ├── config/
+        │   └── .env          <- aqui
+        └── src/
+            └── sirius_mail.py
+
+    Retorna:
+        Path para o .env encontrado, ou None se não existir.
+    """
+    # 1. config/ relativo à raiz do projeto (pai de src/)
+    config_env = Path(diretorio_raiz) / "config" / ".env"
+    if config_env.is_file():
+        return config_env
+
+    # 2. Raiz do projeto
+    raiz_env = Path(diretorio_raiz) / ".env"
+    if raiz_env.is_file():
+        return raiz_env
+
+    # 3. Mesmo diretório de sirius_mail.py (src/)
+    src_env = Path(diretorio_src) / ".env"
+    if src_env.is_file():
+        return src_env
+
+    # 4. Sobe a árvore como último recurso
+    candidato = Path(diretorio_raiz).parent
+    while True:
+        env_path = candidato / ".env"
+        if env_path.is_file():
+            return env_path
+        pai = candidato.parent
+        if pai == candidato:  # chegou à raiz do sistema
+            return None
+        candidato = pai
+
+
+# Campos obrigatórios que o Sirius precisa para acessar o e-mail
+_CAMPOS_OBRIGATORIOS = {
+    "SIRIUS_EMAIL_USER":     "Seu endereço de e-mail (ex: carlos@gmail.com)",
+    "SIRIUS_EMAIL_PASSWORD": "App Password do Gmail (16 caracteres, sem espaços)",
+    "SIRIUS_IMAP_SERVER":    "Servidor IMAP (padrão: imap.gmail.com)",
+    "SIRIUS_IMAP_PORT":      "Porta IMAP  (padrão: 993)",
+}
+
+# Valores padrão para campos opcionais
+_DEFAULTS = {
+    "SIRIUS_IMAP_SERVER": "imap.gmail.com",
+    "SIRIUS_IMAP_PORT":   "993",
+}
+
+
+def _ler_env_bruto(env_path: Path) -> dict:
+    """
+    Lê o .env linha a linha, ignorando comentários e espaços,
+    e retorna apenas os valores limpos (sem o que vem depois de #).
+
+    Exemplo de linha problemática que isto resolve:
+        SIRIUS_EMAIL_PASSWORD=abcdefghijklmnop   # App Password sem espaços
+        → valor lido: "abcdefghijklmnop"  (correto)
+        → sem este parser, dotenv pode incluir o comentário no valor
+    """
+    valores = {}
+    for linha in env_path.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#"):
+            continue
+        if "=" not in linha:
+            continue
+        chave, _, resto = linha.partition("=")
+        chave = chave.strip()
+        # Remove comentário inline (tudo após o primeiro # fora de aspas)
+        valor = resto.split("#")[0].strip().strip('" ')
+        if chave and valor:
+            valores[chave] = valor
+    return valores
+
+
+def _auditar_env(env_path: Optional[Path]) -> dict:
+    """
+    Verifica quais campos obrigatórios estão presentes, ausentes ou
+    ainda com valor de placeholder (ex: "seu_email@gmail.com").
+
+    Retorna dict com status de cada campo:
+        "ok"         → presente e com valor real
+        "ausente"    → não encontrado no .env
+        "placeholder"→ tem valor mas parece exemplo/template
+    """
+    placeholders = {
+        "seu_email@gmail.com", "seuemail@gmail.com",
+        "abcdefghijklmnop", "sua_senha", "app_password",
+        "imap.gmail.com",   # só é placeholder se for SIRIUS_IMAP_SERVER vazio
+    }
+
+    valores_brutos = _ler_env_bruto(env_path) if env_path else {}
+    status = {}
+
+    for campo in _CAMPOS_OBRIGATORIOS:
+        valor = valores_brutos.get(campo, "").strip()
+        if not valor:
+            status[campo] = "ausente"
+        elif valor.lower() in placeholders:
+            status[campo] = "placeholder"
+        else:
+            status[campo] = "ok"
+
+    return status
+
+
+def _exibir_guia_setup(status: dict, env_path: Optional[Path]):
+    """
+    Exibe mensagem clara ao usuário sobre o que está faltando e
+    como configurar o acesso do Sirius ao Gmail.
+    """
+    problemas = {c: s for c, s in status.items() if s != "ok"}
+    if not problemas:
+        return  # tudo ok, sem guia necessário
+
+    caminho_env = str(env_path) if env_path else "config/.env (será criado)"
+
+    print("\n" + "\033[93m" + "─" * 60 + "\033[0m")
+    print("\033[93m[MAIL]: ⚠️  Configuração de e-mail incompleta\033[0m")
+    print("\033[93m" + "─" * 60 + "\033[0m")
+    print(f"  Arquivo: {caminho_env}\n")
+
+    for campo, estado in problemas.items():
+        descricao = _CAMPOS_OBRIGATORIOS[campo]
+        icone = "❌" if estado == "ausente" else "⚠️ "
+        rotulo = "ausente" if estado == "ausente" else "valor de exemplo detectado"
+        print(f"  {icone} {campo}")
+        print(f"       {descricao}")
+        print(f"       Status: {rotulo}\n")
+
+    print("\033[94m  Como liberar o acesso do Sirius ao Gmail:\033[0m")
+    print("  1. Ative a verificação em duas etapas:")
+    print("     → myaccount.google.com  >  Segurança  >  Verificação em duas etapas")
+    print("")
+    print("  2. Gere uma App Password (Senha de App):")
+    print("     → myaccount.google.com/apppasswords")
+    print("     → Selecionar app: Outro  →  Digite \'Sirius\'  →  Gerar")
+    print("     → Copie os 16 caracteres gerados (sem espaços)")
+    print("")
+    print("  3. Ative o IMAP no Gmail:")
+    print("     → Gmail  >  ⚙️ Configurações  >  Ver todas")
+    print("     → Aba \'Encaminhamento e POP/IMAP\'  >  Ativar IMAP")
+    print("")
+    print("  O Sirius vai solicitar suas credenciais a seguir.")
+    print("\033[93m" + "─" * 60 + "\033[0m\n")
+
+
+def _carregar_env() -> Path:
+    """
+    Carrega o .env encontrado, audita os campos e exibe guia se necessário.
+    Retorna o caminho do .env ou None.
+    """
+    try:
+        from dotenv import load_dotenv
+        env_path = _encontrar_env()
+
+        if env_path:
+            # Lê e limpa os valores antes de passar para dotenv
+            # (dotenv nativo pode incluir comentários inline no valor)
+            valores_limpos = _ler_env_bruto(env_path)
+            for chave, valor in valores_limpos.items():
+                if chave not in os.environ:  # respeita override=False
+                    os.environ[chave] = valor
+
+            print(f"\033[94m[MAIL]: .env carregado de: {env_path}\033[0m")
+        else:
+            print("\033[93m[MAIL]: Nenhum arquivo .env encontrado — será criado em config/.env\033[0m")
+
+        # Audita e exibe guia se necessário
+        status = _auditar_env(env_path)
+        _exibir_guia_setup(status, env_path)
+
+        return env_path
+
+    except ImportError:
+        # Sem python-dotenv: lê o .env manualmente mesmo assim
+        env_path = _encontrar_env()
+        if env_path:
+            valores_limpos = _ler_env_bruto(env_path)
+            for chave, valor in valores_limpos.items():
+                if chave not in os.environ:
+                    os.environ[chave] = valor
+            status = _auditar_env(env_path)
+            _exibir_guia_setup(status, env_path)
+        return env_path
+
+
+# Carrega .env uma vez ao importar o módulo
+_ENV_PATH = _carregar_env()
+
+
 class SiriusEmailManager:
     """
     Gerenciador inteligente de e-mails via IMAP.
@@ -54,7 +254,7 @@ class SiriusEmailManager:
     - Conectar ao servidor IMAP
     - Buscar últimos 3 e-mails não lidos
     - Extrair remetente, assunto, conteúdo
-    - Integrar com SiriusMemory para aprendizado
+    - Integrar com SiriusMemoria para aprendizado
     - Registrar auditoria de acessos
     - Detectar prioridade baseada em histórico
     """
@@ -62,33 +262,163 @@ class SiriusEmailManager:
     def __init__(self, memoria=None, user_id: str = "guest"):
         """
         Inicializa gerenciador de e-mail.
-        
+
+        Fluxo de credenciais:
+          1. Lê SIRIUS_EMAIL_USER do .env (já carregado no import)
+          2. Se encontrou um e-mail salvo → confirma com o usuário se é esse
+          3. Se confirmado → usa as credenciais salvas
+          4. Se negado, ou se não havia e-mail → solicita e-mail + senha
+          5. Salva as novas credenciais no .env para uso futuro
+
         Args:
-            memoria: instancia de SiriusMemory
+            memoria: instancia de SiriusMemoria
             user_id: id do usuario (LGPD)
         """
         self.memoria = memoria
         self.user_id = user_id
         self.db_pessoal = DB_PESSOAL
-        
-        # Carregar credenciais do .env
-        self.email_usuario = os.getenv("SIRIUS_EMAIL_USER", "")
-        self.email_senha = os.getenv("SIRIUS_EMAIL_PASSWORD", "")
+
         self.imap_servidor = os.getenv("SIRIUS_IMAP_SERVER", "imap.gmail.com")
         self.imap_porta = int(os.getenv("SIRIUS_IMAP_PORT", "993"))
-        
-        # Validar credenciais
-        if not self.email_usuario or not self.email_senha:
-            print("\033[93m[MAIL]: Aviso: Credenciais IMAP não configuradas no .env\033[0m")
-            print("        Defina: SIRIUS_EMAIL_USER, SIRIUS_EMAIL_PASSWORD")
-            print("        Opcionais: SIRIUS_IMAP_SERVER (padrão: imap.gmail.com)")
-            print("                   SIRIUS_IMAP_PORT (padrão: 993)")
-        
+
+        # Resolve credenciais (confirma ou solicita)
+        self.email_usuario, self.email_senha = self._resolver_credenciais()
+
         self.conexao = None
         self._lock = threading.Lock()
         self._criar_tabelas()
-        
+
         print(f"\033[94m[MAIL]: Inicializando gerenciador de e-mail para user_id={user_id}...\033[0m")
+
+    # ------------------------------------------------------------------ #
+    # Resolução de credenciais                                            #
+    # ------------------------------------------------------------------ #
+
+    def _resolver_credenciais(self) -> Tuple[str, str]:
+        """
+        Determina as credenciais a usar, seguindo o fluxo:
+
+          .env tem e-mail com valor real?
+            ├─ SIM → confirma com o usuário
+            │    ├─ Confirmado + senha ok  → usa credenciais salvas
+            │    ├─ Confirmado + sem senha → pede só a senha
+            │    └─ Negado                → pede e-mail + senha novos
+            └─ NÃO (ausente ou placeholder) → pede e-mail + senha
+
+        Usa _auditar_env para detectar placeholders e campos ausentes.
+
+        Retorna:
+            (email: str, senha: str)
+        """
+        status = _auditar_env(_ENV_PATH)
+
+        email_salvo = os.getenv("SIRIUS_EMAIL_USER", "").strip()
+        senha_salva = os.getenv("SIRIUS_EMAIL_PASSWORD", "").strip()
+
+        email_ok  = status.get("SIRIUS_EMAIL_USER",     "ausente") == "ok"
+        senha_ok  = status.get("SIRIUS_EMAIL_PASSWORD", "ausente") == "ok"
+
+        if email_ok:
+            # E-mail real encontrado — confirma com o usuário
+            print(f"\n\033[94m[MAIL]: E-mail configurado encontrado: \033[1m{email_salvo}\033[0m")
+            resposta = input("[MAIL]: Este é o e-mail correto? (s/n): ").strip().lower()
+
+            if resposta in ("s", "sim", "y", "yes"):
+                if senha_ok:
+                    print("\033[92m[MAIL]: Credenciais carregadas do .env ✓\033[0m")
+                    return email_salvo, senha_salva
+                else:
+                    # Senha ausente ou placeholder
+                    motivo = "não encontrada" if status["SIRIUS_EMAIL_PASSWORD"] == "ausente" else "valor de exemplo detectado"
+                    print(f"\033[93m[MAIL]: Senha {motivo} no .env. Por favor, informe:\033[0m")
+                    senha = self._solicitar_senha()
+                    self._salvar_credenciais_env(email_salvo, senha)
+                    return email_salvo, senha
+            else:
+                print("\033[93m[MAIL]: Ok! Informe as novas credenciais:\033[0m")
+        else:
+            motivo = "não cadastrado" if status["SIRIUS_EMAIL_USER"] == "ausente" else "valor de exemplo detectado no .env"
+            print(f"\033[93m[MAIL]: E-mail {motivo}. Informe as credenciais:\033[0m")
+
+        # Solicita e-mail + senha novos
+        novo_email = self._solicitar_email()
+        nova_senha = self._solicitar_senha()
+        self._salvar_credenciais_env(novo_email, nova_senha)
+        return novo_email, nova_senha
+
+    @staticmethod
+    def _solicitar_email() -> str:
+        """Solicita e-mail até receber um valor válido."""
+        while True:
+            valor = input("[MAIL]: Digite seu e-mail: ").strip()
+            if "@" in valor and "." in valor.split("@")[-1]:
+                return valor
+            print("\033[91m[MAIL]: E-mail inválido. Tente novamente.\033[0m")
+
+    @staticmethod
+    def _solicitar_senha() -> str:
+        """Solicita senha via getpass (não exibe no terminal)."""
+        import getpass
+        while True:
+            valor = getpass.getpass("[MAIL]: Digite sua senha (App Password para Gmail): ")
+            if valor.strip():
+                return valor.strip()
+            print("\033[91m[MAIL]: Senha não pode ser vazia.\033[0m")
+
+    @staticmethod
+    def _salvar_credenciais_env(email: str, senha: str):
+        """
+        Grava/atualiza SIRIUS_EMAIL_USER e SIRIUS_EMAIL_PASSWORD no .env.
+
+        Se o .env já existe, substitui as linhas correspondentes.
+        Se não existe, cria o arquivo no diretório raiz do projeto.
+        """
+        try:
+            # Se já encontramos o .env antes, usa ele.
+            # Se não, cria em config/ (padrão do Sirius) — criando a pasta se necessário.
+            if _ENV_PATH:
+                env_path = _ENV_PATH
+            else:
+                env_path = Path(diretorio_raiz) / "config" / ".env"
+                env_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Lê conteúdo atual (se existir)
+            linhas = []
+            if env_path.is_file():
+                linhas = env_path.read_text(encoding="utf-8").splitlines()
+
+            # Substitui ou adiciona cada chave
+            novas = {
+                "SIRIUS_EMAIL_USER": email,
+                "SIRIUS_EMAIL_PASSWORD": senha,
+            }
+            chaves_atualizadas = set()
+            resultado = []
+
+            for linha in linhas:
+                chave = linha.split("=", 1)[0].strip()
+                if chave in novas:
+                    resultado.append(f'{chave}={novas[chave]}')
+                    chaves_atualizadas.add(chave)
+                else:
+                    resultado.append(linha)
+
+            # Adiciona chaves que ainda não existiam
+            for chave, valor in novas.items():
+                if chave not in chaves_atualizadas:
+                    resultado.append(f'{chave}={valor}')
+
+            env_path.write_text("\n".join(resultado) + "\n", encoding="utf-8")
+
+            # Atualiza os valores em memória para a sessão atual
+            os.environ["SIRIUS_EMAIL_USER"] = email
+            os.environ["SIRIUS_EMAIL_PASSWORD"] = senha
+
+            print(f"\033[92m[MAIL]: Credenciais salvas em {env_path} ✓\033[0m")
+
+        except Exception as e:
+            print(f"\033[91m[MAIL]: Não foi possível salvar no .env: {e}\033[0m")
+            print("        As credenciais serão usadas apenas nesta sessão.")
     
     def _criar_tabelas(self):
         """Cria tabelas para rastreamento de e-mails e auditoria."""
@@ -151,9 +481,9 @@ class SiriusEmailManager:
             with self._lock:
                 if self.conexao:
                     try:
-                        self.conexao.close()
-                    except:
-                        pass
+                        self.conexao.logout()
+                    except (imaplib.IMAP4.error, OSError):
+                        pass  # conexão já estava morta — seguro ignorar
                 
                 print(f"\033[94m[MAIL]: Conectando a {self.imap_servidor}:{self.imap_porta}...\033[0m")
                 
@@ -180,7 +510,14 @@ class SiriusEmailManager:
         try:
             with self._lock:
                 if self.conexao:
-                    self.conexao.close()
+                    try:
+                        self.conexao.close()  # fecha mailbox selecionado
+                    except Exception:
+                        pass  # pode falhar se nenhum mailbox foi selecionado
+                    try:
+                        self.conexao.logout()  # encerra a sessão IMAP de verdade
+                    except Exception:
+                        pass
                     self.conexao = None
                     print("\033[92m[MAIL]: Desconectado do servidor IMAP\033[0m")
         except Exception as e:
@@ -296,13 +633,13 @@ class SiriusEmailManager:
                     try:
                         corpo = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         break
-                    except:
-                        pass
+                    except (UnicodeDecodeError, AttributeError):
+                        pass  # parte não decodificável — tenta a próxima
         else:
             try:
                 corpo = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-            except:
-                corpo = msg.get_payload()
+            except (UnicodeDecodeError, AttributeError):
+                corpo = msg.get_payload()  # fallback: payload bruto como string
         
         return corpo.strip()
     
@@ -310,7 +647,7 @@ class SiriusEmailManager:
         """
         Resume conteúdo do e-mail (simples).
         
-        Em produção, poderia usar SiriusMemory para resumo por IA.
+        Em produção, poderia usar SiriusMemoria para resumo por IA.
         """
         # Remove linhas em branco múltiplas
         linhas = [l.strip() for l in conteudo.split('\n') if l.strip()]
@@ -362,8 +699,8 @@ class SiriusEmailManager:
             try:
                 # Simples: verifica se está no histórico
                 score += 0.1
-            except:
-                pass
+            except Exception:
+                pass  # memória indisponível — score sem bônus de histórico
         
         # Normaliza score para 0-1
         score = min(score, 1.0)
@@ -384,7 +721,7 @@ class SiriusEmailManager:
         
         Args:
             callback_ia: função callback que recebe lista de e-mails
-                        para decisão do LLM (SiriusMemory)
+                        para decisão do LLM (SiriusMemoria)
         
         Retorna:
             {
@@ -433,7 +770,7 @@ class SiriusEmailManager:
                     score_maximo = score
                     nivel_maximo = nivel
             
-            # Chamada callback para IA (SiriusMemory) decidir ação
+            # Chamada callback para IA (SiriusMemoria) decidir ação
             if callback_ia:
                 try:
                     callback_ia(emails_analisados)
@@ -445,7 +782,7 @@ class SiriusEmailManager:
             
             # Prepara mensagem para usuário
             if requer_interrupcao:
-                email_urgente = emails_analisados[0]
+                email_urgente = max(emails_analisados, key=lambda e: e["score_prioridade"])
                 mensagem = (
                     f"Carlos, você recebeu um e-mail importante!\n"
                     f"De: {email_urgente['remetente']}\n"
@@ -474,6 +811,27 @@ class SiriusEmailManager:
                 "mensagem_usuario": f"Erro ao processar e-mails: {e}"
             }
     
+    def processar_emails_bg(self, callback_ia=None, callback_resultado=None):
+        """
+        Processa e-mails em background via threading para não bloquear a UI.
+
+        Args:
+            callback_ia: função callback que recebe lista de e-mails para decisão do LLM
+            callback_resultado: função chamada ao final com o resultado do processamento
+        """
+        def _processar_emails_interno():
+            resultado = self.processar_emails(callback_ia=callback_ia)
+            if callback_resultado:
+                try:
+                    callback_resultado(resultado)
+                except Exception as e:
+                    print(f"[MAIL]: Erro no callback de resultado: {e}")
+
+        threading.Thread(
+            target=_processar_emails_interno,
+            daemon=True
+        ).start()
+
     def _salvar_email_processado(self, email_dict: Dict[str, Any]):
         """Salva e-mail processado no banco para auditoria."""
         try:

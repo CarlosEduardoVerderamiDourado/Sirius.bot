@@ -684,3 +684,193 @@ class SiriusParalelo:
             return "\n".join(linhas)
 
         return "Comando de tarefa não reconhecido."
+
+# =============================================================================
+# DetectorParalelo — detecta paralelismo/sequência em texto (absorvido de sirius_tarefas.py)
+# =============================================================================
+
+class DetectorParalelo:
+    """
+    Detecta quando um comando contém múltiplas ações a executar.
+
+    Padrões reconhecidos:
+      "X e Y"                   → paralelo (quando Y começa com verbo de ação)
+      "X enquanto Y"            → paralelo
+      "X ao mesmo tempo que Y"  → paralelo
+      "primeiro X depois Y"     → sequencial
+      "X e depois Y"            → sequencial
+
+    Diferença de detectar_tipo_execucao(): retorna dict com partes já divididas
+    em vez de apenas o tipo, e usa regex de posição em vez de triggers exatos.
+    """
+
+    _PARALELO = [
+        r"\s+e\s+(?:também\s+)?(?:abre?|fecha?|manda?|cria?|pesquisa?|reproduz|toca?|mostra?|calcula?|verifica?)",
+        r"\s+enquanto\s+",
+        r"\s+ao\s+mesmo\s+tempo\s+(?:que|em\s+que)\s+",
+        r"\s+simultaneamente\s+",
+        r"\s+junto\s+com\s+",
+    ]
+
+    _SEQUENCIAL = [
+        r"\s+(?:e\s+)?depois\s+",
+        r"\s+(?:e\s+)?então\s+",
+        r"\s+(?:e\s+)?em\s+seguida\s+",
+        r"\s+após\s+isso\s+",
+        r"primeiro\s+.+?\s+depois\s+",
+        r"\s+e\s+depois\s+",
+    ]
+
+    def analisar(self, texto: str) -> dict:
+        """
+        Retorna:
+            {"tipo": "simples",    "partes": [texto]}
+            {"tipo": "paralelo",   "partes": [a, b, ...]}
+            {"tipo": "sequencial", "partes": [a, b, ...]}
+        """
+        t = texto.lower().strip()
+
+        for padrao in self._SEQUENCIAL:
+            m = re.search(padrao, t, re.IGNORECASE)
+            if m:
+                partes = self._dividir(texto, m.start(), m.end())
+                if len(partes) >= 2 and all(len(p.strip()) > 5 for p in partes):
+                    return {"tipo": "sequencial", "partes": partes}
+
+        for padrao in self._PARALELO:
+            m = re.search(padrao, t, re.IGNORECASE)
+            if m:
+                partes = self._dividir(texto, m.start(), m.end())
+                if len(partes) >= 2 and all(len(p.strip()) > 5 for p in partes):
+                    return {"tipo": "paralelo", "partes": partes}
+
+        return {"tipo": "simples", "partes": [texto]}
+
+    def _dividir(self, texto: str, inicio: int, fim: int) -> list[str]:
+        parte1 = texto[:inicio].strip()
+        parte2 = texto[fim:].strip()
+        return [p for p in [parte1, parte2] if p]
+
+
+# =============================================================================
+# GerenciadorTarefas — API simples para cerebro.py (absorvido de sirius_tarefas.py)
+# =============================================================================
+
+class GerenciadorTarefas:
+    """
+    Orquestra execução paralela e sequencial de tarefas.
+    Wrapper sobre SiriusParalelo com interface compatível com cerebro.py v5.2.
+
+    Integração no cerebro.py:
+        from sirius_paralelo import GerenciadorTarefas
+        self._tarefas = GerenciadorTarefas(cerebro=self)
+
+        # No processar():
+        resultado = self._tarefas.processar(comando, fn_executar=self.processar)
+        if resultado:
+            return resultado   # múltiplas ações — resposta já montada
+        # caso contrário continua o fluxo normal
+    """
+
+    MAX_PARALELAS = 4
+
+    def __init__(self, cerebro=None, callback_log: Callable = None):
+        self._cerebro      = cerebro
+        self._callback_log = callback_log
+        self._detector     = DetectorParalelo()
+        self._paralelo     = SiriusParalelo(callback_log=callback_log)
+
+    # ── API principal ──────────────────────────────────────────────────────────
+
+    def processar(self, comando: str, executar_fn: Callable) -> str | None:
+        """
+        Analisa o comando. Se tiver múltiplas ações, executa em paralelo/sequência.
+        Retorna None se for comando simples (cerebro processa normalmente).
+
+        executar_fn: fn(texto: str) → str — função do cerebro para um comando simples
+        """
+        analise = self._detector.analisar(comando)
+        if analise["tipo"] == "simples":
+            return None
+
+        partes = analise["partes"]
+        modo   = analise["tipo"]
+        print(f"\033[94m[TAREFAS]: {modo.upper()} — {len(partes)} ações detectadas\033[0m")
+        for i, p in enumerate(partes, 1):
+            print(f"  [{i}] {p}")
+
+        if modo == "paralelo":
+            return self._executar_paralelo(partes, executar_fn)
+        return self._executar_sequencial(partes, executar_fn)
+
+    def _executar_paralelo(self, partes: list[str], executar_fn: Callable) -> str:
+        ativas = len(self._paralelo.listar_ativas())
+        if ativas + len(partes) > self.MAX_PARALELAS:
+            return (
+                f"Já tenho {ativas} tarefa(s) rodando, chefe. "
+                f"Máximo é {self.MAX_PARALELAS} simultâneas."
+            )
+
+        tarefas_criadas = []
+        for parte in partes:
+            # Usa lambda para encapsular args — Tarefa de sirius_paralelo chama fn()
+            fn_wrapped = (lambda p: lambda: executar_fn(p))(parte)
+            t = self._paralelo.lancar(
+                nome      = parte[:40],
+                fn        = fn_wrapped,
+                prioridade = PrioridadeTarefa.ALTA,
+                timeout   = 30.0,
+            )
+            tarefas_criadas.append(t)
+
+        # Aguarda todas
+        for t in tarefas_criadas:
+            t.aguardar(timeout=30.0)
+
+        # Monta resposta
+        resultados = []
+        for t in tarefas_criadas:
+            if t.estado == EstadoTarefa.CONCLUIDA and t.resultado:
+                resultados.append(f"✓ {t.resultado}")
+            elif t.estado == EstadoTarefa.FALHOU:
+                resultados.append(f"✗ '{t.nome[:30]}' falhou: {t.erro}")
+            else:
+                resultados.append(f"✓ '{t.nome[:30]}' concluído.")
+        return "\n".join(resultados)
+
+    def _executar_sequencial(self, partes: list[str], executar_fn: Callable) -> str:
+        resultados = []
+        for i, parte in enumerate(partes, 1):
+            print(f"\033[94m[TAREFAS]: [{i}/{len(partes)}] {parte[:50]}\033[0m")
+            try:
+                resultado = executar_fn(parte)
+                resultados.append(f"✓ [{i}] {resultado or parte[:40]}")
+            except Exception as e:
+                resultados.append(f"✗ [{i}] Falhou: {e}")
+        return "\n".join(resultados)
+
+    # ── Delegados para SiriusParalelo ─────────────────────────────────────────
+
+    def lancar_background(self, nome: str, fn: Callable,
+                           prioridade: PrioridadeTarefa = PrioridadeTarefa.NORMAL,
+                           callback_fim: Callable = None) -> Tarefa:
+        return self._paralelo.lancar(
+            nome=nome, fn=fn, prioridade=prioridade,
+            callback=callback_fim, timeout=120.0,
+        )
+
+    def cancelar_todas(self) -> str:
+        n = self._paralelo.cancelar_todas()
+        return f"✓ {n} tarefa(s) cancelada(s)." if n else "Nenhuma tarefa ativa."
+
+    def status(self) -> str:
+        return self._paralelo.processar_comando("status das tarefas")
+
+    def e_comando_tarefa(self, texto: str) -> bool:
+        return self._paralelo.e_comando_de_tarefas(texto)
+
+    def processar_comando(self, texto: str) -> str:
+        return self._paralelo.processar_comando(texto)
+
+    def n_ativas(self) -> int:
+        return len(self._paralelo.listar_ativas())

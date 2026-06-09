@@ -98,7 +98,7 @@ def exemplo_langgraph_agent():
     
     from sirius_os_vision import vision_tool_factory
     from sirius_executor import executor_tool_factory
-    from memoria import SiriusMemory
+    from memoria import SiriusMemoria
     
     # ── State Definition ──────────────────────────────────────────────────
     class SiriusAgentState(TypedDict):
@@ -111,7 +111,7 @@ def exemplo_langgraph_agent():
         iteration: int
     
     # ── Inicializar memoria e tools ───────────────────────────────────────
-    memoria = SiriusMemory()
+    memoria = SiriusMemoria()
     user_id = "carlos"
     
     vision_tool = vision_tool_factory(memoria=memoria, user_id=user_id)
@@ -345,7 +345,7 @@ def exemplo_langgraph_email():
         return
     
     from sirius_mail import email_tool_factory
-    from memoria import SiriusMemory
+    from memoria import SiriusMemoria
     
     # ── State Definition ──────────────────────────────────────────────────
     class EmailAgentState(TypedDict):
@@ -357,7 +357,7 @@ def exemplo_langgraph_email():
         acao_tomada: str
     
     # ── Inicializar ───────────────────────────────────────────────────────
-    memoria = SiriusMemory()
+    memoria = SiriusMemoria()
     user_id = "carlos"
     email_tool = email_tool_factory(memoria=memoria, user_id=user_id)
     

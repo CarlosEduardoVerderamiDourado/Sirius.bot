@@ -68,7 +68,7 @@ for p in [diretorio_src, diretorio_raiz]:
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Request
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
@@ -228,6 +228,51 @@ class _GerenciadorTunel:
 
 
 _tunel_global = _GerenciadorTunel()
+
+# =============================================================================
+# Proteção de controle do PC
+# =============================================================================
+# Lista de user_ids que podem acionar comandos locais (controle_pc).
+# Configure via variável de ambiente, ex:
+#   SIRIUS_PC_OWNERS=joao,admin   python sirius_server.py
+# Se vazia, NENHUM usuário externo pode controlar o PC (mais seguro).
+_PC_OWNER_IDS: set[str] = set(
+    uid.strip()
+    for uid in os.getenv("SIRIUS_PC_OWNERS", "").split(",")
+    if uid.strip()
+)
+
+if _PC_OWNER_IDS:
+    print(f"\033[93m[SEGURANÇA]: Controle de PC permitido para: {', '.join(_PC_OWNER_IDS)}\033[0m")
+else:
+    print("\033[93m[SEGURANÇA]: Controle de PC BLOQUEADO para todos (defina SIRIUS_PC_OWNERS para habilitar).\033[0m")
+
+
+# =============================================================================
+# Rate limiter simples (proteção contra força bruta)
+# =============================================================================
+
+class _RateLimiter:
+    """Limita requisições por IP: máx N chamadas a cada janela de segundos."""
+
+    def __init__(self, max_calls: int = 30, janela_seg: int = 60):
+        self._max   = max_calls
+        self._jan   = janela_seg
+        self._dados: dict[str, list[float]] = {}
+        self._lock  = threading.Lock()
+
+    def permitir(self, ip: str) -> bool:
+        agora = time.time()
+        with self._lock:
+            historico = self._dados.get(ip, [])
+            historico = [t for t in historico if agora - t < self._jan]
+            if len(historico) >= self._max:
+                return False
+            historico.append(agora)
+            self._dados[ip] = historico
+            return True
+
+_rate_limiter = _RateLimiter(max_calls=30, janela_seg=60)   # 30 req/min por IP
 
 
 class GerenciadorWS:
@@ -680,7 +725,15 @@ class SiriusServidor:
             )
 
         @app.post("/comando", response_model=RespostaModel)
-        async def comando(req: ComandoRequest, authorization: Optional[str] = Header(None)):
+        async def comando(req: ComandoRequest, authorization: Optional[str] = Header(None),
+                          request: "Request" = None):
+            # ── Rate limiting ─────────────────────────────────────────────────
+            ip_cliente = "desconhecido"
+            if request:
+                ip_cliente = request.client.host if request.client else "desconhecido"
+            if not _rate_limiter.permitir(ip_cliente):
+                raise HTTPException(429, "Muitas requisições. Tente novamente em instantes.")
+
             if not req.texto.strip():
                 raise HTTPException(400, "Texto vazio.")
 
@@ -714,6 +767,15 @@ class SiriusServidor:
                 memoria.salvar_historico(texto, resposta if not isinstance(resposta, dict) else "[COMANDO_LOCAL]")
 
             if isinstance(resposta, dict) and resposta.get("tipo") == "comando_local":
+                user_id = memoria.user_id if memoria else None
+
+                # ── Proteção de controle do PC ────────────────────────────────
+                if not memoria:
+                    raise HTTPException(401, "Autenticação necessária para controlar o PC.")
+                if _PC_OWNER_IDS and user_id not in _PC_OWNER_IDS:
+                    raise HTTPException(403, f"Usuário '{user_id}' não tem permissão para controlar o PC.")
+                # ─────────────────────────────────────────────────────────────
+
                 sent = False
                 user_id = memoria.user_id if memoria else None
                 if user_id and req.device_id:
@@ -1030,6 +1092,25 @@ class SiriusServidor:
                     async with self._process_lock:
                         resposta = await self.processar_comando(texto, memoria)
 
+                    # ── Proteção de controle do PC via WebSocket ──────────────
+                    if isinstance(resposta, dict) and resposta.get("tipo") == "comando_local":
+                        ws_user = memoria.user_id if memoria else None
+                        if not memoria or (user_id == "guest"):
+                            await self._gerente.enviar(ws, {
+                                "tipo": "sirius",
+                                "texto": "⛔ Autenticação necessária para controlar o PC.",
+                                "timestamp": datetime.now().isoformat(),
+                            })
+                            continue
+                        if _PC_OWNER_IDS and ws_user not in _PC_OWNER_IDS:
+                            await self._gerente.enviar(ws, {
+                                "tipo": "sirius",
+                                "texto": f"⛔ Sem permissão para controlar o PC.",
+                                "timestamp": datetime.now().isoformat(),
+                            })
+                            continue
+                    # ─────────────────────────────────────────────────────────
+
                     if memoria:
                         memoria.salvar_historico(texto, resposta)
 
@@ -1046,6 +1127,13 @@ class SiriusServidor:
                 await self._gerente.desconectar(ws)
 
         # ── GET /ip — retorna o IP da máquina para facilitar configuração ─────
+        # ── GET /static/<path> — serve arquivos estáticos (CSS, JS, imgs) ──
+        from fastapi.staticfiles import StaticFiles as _StaticFiles
+        _static_dir = os.path.join(diretorio_src, "static")
+        if os.path.isdir(_static_dir):
+            app.mount("/static", _StaticFiles(directory=_static_dir), name="static")
+            print(f"[SERVIDOR]: /static → {_static_dir}")
+
         @app.get("/ip")
         async def meu_ip():
             return {"ip": _obter_ip_local(), "porta": 5000}
@@ -1125,7 +1213,23 @@ def _obter_ip_local() -> str:
 
 
 def _html_interface(ip: str) -> str:
-    """Interface web embutida — acessível de qualquer dispositivo na rede."""
+    """
+    Serve o index.html externo (templates/index.html).
+    Fallback para HTML embutido mínimo se o arquivo não for encontrado.
+    """
+    # Procura em:  src/templates/index.html  ou  src/index.html
+    candidatos = [
+        os.path.join(diretorio_src, "templates", "index.html"),
+        os.path.join(diretorio_src, "index.html"),
+        os.path.join(diretorio_raiz, "templates", "index.html"),
+        os.path.join(diretorio_raiz, "index.html"),
+    ]
+    for caminho in candidatos:
+        if os.path.isfile(caminho):
+            with open(caminho, "r", encoding="utf-8") as f:
+                return f.read()
+
+    # Fallback mínimo se o arquivo não existir
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -1133,216 +1237,20 @@ def _html_interface(ip: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>S.I.R.I.U.S.</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: #000a12;
-    color: #5de2ff;
-    font-family: 'Consolas', monospace;
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }}
-  #header {{
-    padding: 12px 20px;
-    border-bottom: 1px solid #1a3a4a;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: rgba(0,20,40,0.8);
-  }}
-  #titulo {{ font-size: 14px; font-weight: bold; letter-spacing: 4px; }}
-  #status-dot {{
-    width: 8px; height: 8px; border-radius: 50%;
-    background: #5de2ff; display: inline-block;
-    margin-right: 6px; animation: pulsar 2s infinite;
-  }}
-  @keyframes pulsar {{
-    0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.3; }}
-  }}
-  #chat {{
-    flex: 1;
-    overflow-y: auto;
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }}
-  .msg {{
-    max-width: 80%;
-    padding: 10px 14px;
-    border-radius: 10px;
-    font-size: 13px;
-    line-height: 1.5;
-    word-break: break-word;
-  }}
-  .msg.usuario {{
-    align-self: flex-end;
-    background: rgba(93,226,255,0.12);
-    border: 1px solid rgba(93,226,255,0.3);
-    color: #fff;
-  }}
-  .msg.sirius {{
-    align-self: flex-start;
-    background: rgba(0,30,50,0.8);
-    border: 1px solid #1a4a5a;
-    color: #5de2ff;
-  }}
-  .msg.sistema {{
-    align-self: center;
-    color: rgba(93,226,255,0.4);
-    font-size: 11px;
-    border: none;
-    background: none;
-  }}
-  .hora {{ font-size: 10px; opacity: 0.4; margin-top: 4px; }}
-  #input-area {{
-    padding: 12px 16px;
-    border-top: 1px solid #1a3a4a;
-    display: flex;
-    gap: 8px;
-    background: rgba(0,10,20,0.9);
-  }}
-  #input {{
-    flex: 1;
-    background: rgba(93,226,255,0.06);
-    border: 1px solid rgba(93,226,255,0.3);
-    border-radius: 8px;
-    color: #fff;
-    padding: 10px 14px;
-    font-family: inherit;
-    font-size: 14px;
-    outline: none;
-  }}
-  #input:focus {{ border-color: #5de2ff; }}
-  #btn {{
-    background: rgba(93,226,255,0.12);
-    border: 1px solid #5de2ff;
-    border-radius: 8px;
-    color: #5de2ff;
-    padding: 0 18px;
-    font-size: 18px;
-    cursor: pointer;
-    transition: background 0.2s;
-  }}
-  #btn:hover {{ background: rgba(93,226,255,0.25); }}
-  #conectado {{ font-size: 11px; color: rgba(93,226,255,0.5); }}
-  ::-webkit-scrollbar {{ width: 4px; }}
-  ::-webkit-scrollbar-thumb {{ background: rgba(93,226,255,0.2); border-radius: 2px; }}
+  body {{ background:#000a14; color:#5de2ff; font-family:monospace;
+          display:flex; align-items:center; justify-content:center;
+          height:100vh; flex-direction:column; gap:16px; }}
+  h1 {{ letter-spacing:6px; font-size:20px; }}
+  p  {{ opacity:.5; font-size:12px; }}
+  a  {{ color:#00ff88; }}
 </style>
 </head>
 <body>
-<div id="header">
-  <div id="titulo">⬛ S.I.R.I.U.S.</div>
-  <div><span id="status-dot"></span><span id="conectado">conectando...</span></div>
-</div>
-<div id="chat"></div>
-<div id="input-area">
-  <input id="input" placeholder="Digite um comando ou pergunta..." autocomplete="off">
-  <button id="btn" onclick="enviar()">▶</button>
-</div>
-
-<script>
-// URL dinâmica — funciona tanto na rede local quanto via túnel (ngrok, cloudflare)
-// window.location.host já contém host:porta corretamente
-const proto  = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const WS_URL = proto + '//' + window.location.host + '/ws';
-let ws;
-
-function conectar() {{
-  ws = new WebSocket(WS_URL);
-
-  ws.onopen = () => {{
-    const storage = window.localStorage;
-    const userId = storage.getItem('sirius_user_id') || prompt('Informe seu user_id (ex: joao)', 'joao') || 'guest';
-    const deviceName = storage.getItem('sirius_device_name') || prompt('Nome deste dispositivo', navigator.platform || 'Navegador') || 'Navegador';
-    storage.setItem('sirius_user_id', userId);
-    storage.setItem('sirius_device_name', deviceName);
-    ws.send(JSON.stringify({{ user_id: userId, device_name: deviceName }}));
-
-    document.getElementById('conectado').textContent = 'conectado';
-    document.getElementById('status-dot').style.background = '#00ff88';
-    adicionarMsg('Conectado ao S.I.R.I.U.S.', 'sistema');
-  }};
-
-  ws.onmessage = (e) => {{
-    try {{
-      const d = JSON.parse(e.data);
-      if (d.tipo === 'sirius' || d.tipo === 'proativo') {{
-        adicionarMsg(d.texto, 'sirius', d.timestamp);
-      }} else if (d.tipo === 'usuario') {{
-        // Só mostra se não foi a gente (evita duplicata)
-        // (o eco do servidor confirma recebimento)
-      }} else if (d.tipo === 'bem_vindo') {{
-        adicionarMsg(d.mensagem, 'sistema');
-      }} else if (d.tipo === 'estado') {{
-        atualizarEstado(d.estado);
-      }} else if (d.tipo === 'log') {{
-        console.log('[LOG]', d.texto);
-      }}
-    }} catch(ex) {{
-      adicionarMsg(e.data, 'sirius');
-    }}
-  }};
-
-  ws.onclose = () => {{
-    document.getElementById('conectado').textContent = 'desconectado — reconectando...';
-    document.getElementById('status-dot').style.background = '#ff4444';
-    setTimeout(conectar, 3000);
-  }};
-
-  ws.onerror = () => {{
-    document.getElementById('conectado').textContent = 'erro de conexão';
-    document.getElementById('status-dot').style.background = '#ffd700';
-  }};
-}}
-
-function atualizarEstado(estado) {{
-  const cores = {{
-    STANDBY: '#5de2ff', OUVINDO: '#00ff88',
-    PROCESSANDO: '#ffd700', FALANDO: '#fff'
-  }};
-  document.getElementById('status-dot').style.background = cores[estado] || '#5de2ff';
-  document.getElementById('conectado').textContent = estado.toLowerCase();
-}}
-
-function adicionarMsg(texto, tipo, timestamp) {{
-  const chat = document.getElementById('chat');
-  const div  = document.createElement('div');
-  div.className = 'msg ' + tipo;
-
-  const hora = timestamp
-    ? new Date(timestamp).toLocaleTimeString('pt-BR', {{hour:'2-digit', minute:'2-digit'}})
-    : new Date().toLocaleTimeString('pt-BR', {{hour:'2-digit', minute:'2-digit'}});
-
-  div.innerHTML = `<div>${{texto.replace(/\\n/g,'<br>')}}</div>
-    ${{tipo !== 'sistema' ? `<div class="hora">${{hora}}</div>` : ''}}`;
-
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-}}
-
-function enviar() {{
-  const input = document.getElementById('input');
-  const texto = input.value.trim();
-  if (!texto) return;
-
-  adicionarMsg(texto, 'usuario');
-  input.value = '';
-
-  if (ws && ws.readyState === WebSocket.OPEN) {{
-    ws.send(JSON.stringify({{texto}}));
-  }}
-}}
-
-document.getElementById('input').addEventListener('keydown', e => {{
-  if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); enviar(); }}
-}});
-
-conectar();
-</script>
+  <h1>⬛ S.I.R.I.U.S.</h1>
+  <p>Arquivo <code>templates/index.html</code> não encontrado.</p>
+  <p>IP local: <a href="http://{ip}:5000">http://{ip}:5000</a></p>
 </body>
 </html>"""
-
 
 # =============================================================================
 # Função pública de inicialização

@@ -1,847 +1,581 @@
 """
-controle_pc.py - Modulo de controle do sistema pelo Sirius
-Cobre: programas, arquivos, janelas, volume, midia, energia, clipboard, screenshots, mouse/teclado.
+controle_pc.py — Módulo de Controle do PC para o S.I.R.I.U.S.
+==============================================================
+Responsabilidades:
+  • Fornecer funções de controle do Windows em background (sem travar a UI)
+  • Ser instanciado pelo SiriusCerebro como self.controle
+  • Expor apenas funções seguras, sem deletar arquivos ou formatar discos
+
+Funções disponíveis (referenciadas no MASTER_SYSTEM_PROMPT):
+  abrir_programa(nome_ou_caminho)
+  fechar_programa(nome)
+  gerenciar_volume(acao)
+  tirar_screenshot()
+  matar_processo(nome_ou_pid)
+  uso_cpu_ram()
+  criar_arquivo_com_conteudo(nome, conteudo, pasta)
+  copiar_para_area_transferencia(texto)
+  abrir_url(url)
+  pesquisar_na_web(query)
+  enviar_mensagem_universal(plataforma, destinatario, mensagem)
+
+Design:
+  • Cada método retorna uma string de confirmação (ex: "Word aberto.")
+  • Operações pesadas usam subprocess.Popen (non-blocking)
+  • Operações de volume e processo usam ctypes/psutil (background-safe)
+  • pyautogui é importado apenas em executar_macro() (explicitamente bloqueante)
 """
 
+from __future__ import annotations
+
 import os
+import sys
 import re
-import time
-import shutil
 import subprocess
-import unicodedata
-from functools import lru_cache
-import pyperclip
-import pyautogui
-import pygetwindow as gw
+import threading
+import webbrowser
+import datetime
+from typing import Union, Optional
 
-# Reduzido de 0.3 para 0.1 — pyautogui.PAUSE é aplicado a CADA ação
-# 0.3 × 10 ações = 3s de overhead desnecessário em automações longas
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE    = 0.08
+# ── Dependências opcionais ─────────────────────────────────────────────────── #
 
-# ---------------------------------------------------------------------------
-# Apps de mensagens suportados (nicho fixo)
-# ---------------------------------------------------------------------------
+try:
+    import psutil
+    _PSUTIL_OK = True
+except ImportError:
+    _PSUTIL_OK = False
 
-APPS_MENSAGENS = {
-    "discord":  {"titulo": "Discord",  "atalho_busca": ["ctrl", "k"]},
-    "whatsapp": {"titulo": "WhatsApp", "atalho_busca": ["ctrl", "f"]},
-    "telegram": {"titulo": "Telegram", "atalho_busca": ["ctrl", "f"]},
-    "slack":    {"titulo": "Slack",    "atalho_busca": ["ctrl", "k"]},
-}
+try:
+    import pyperclip
+    _PYPERCLIP_OK = True
+except ImportError:
+    _PYPERCLIP_OK = False
 
-# ---------------------------------------------------------------------------
-# Apps do sistema com comando direto (nao precisam de busca)
-# ---------------------------------------------------------------------------
+try:
+    from PIL import ImageGrab
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
 
-APPS_SISTEMA = {
-    "notepad":            "notepad",
-    "bloco de notas":     "notepad",
-    "word":               "winword",
-    "excel":              "excel",
-    "powerpoint":         "powerpnt",
-    "outlook":            "outlook",
-    "vscode":             "code",
-    "vs code":            "code",
-    "visual studio code": "code",
-    "explorador":         "explorer",
-    "explorer":           "explorer",
-    "gerenciador de tarefas": "taskmgr",
-    "task manager":       "taskmgr",
-    "painel de controle": "control",
-    "calculadora":        "calc",
-    "calculator":         "calc",
-    "cmd":                "cmd",
-    "terminal":           "wt",
-    "powershell":         "powershell",
-    "paint":              "mspaint",
-    "configuracoes":      "ms-settings:",
-    "configurações":      "ms-settings:",
-}
-
-# Palavras que o usuario pode falar para pedir o navegador
-PALAVRAS_NAVEGADOR = {
-    "navegador", "browser", "chrome", "firefox", "edge", "opera",
-    "brave", "vivaldi", "internet", "web"
-}
-
-# Pastas de destino amigas
-PASTAS_USUARIO = {
-    "documentos": os.path.join(os.path.expanduser("~"), "Documents"),
-    "documents":  os.path.join(os.path.expanduser("~"), "Documents"),
-    "desktop":    os.path.join(os.path.expanduser("~"), "Desktop"),
-    "downloads":  os.path.join(os.path.expanduser("~"), "Downloads"),
-    "imagens":    os.path.join(os.path.expanduser("~"), "Pictures"),
-    "pictures":   os.path.join(os.path.expanduser("~"), "Pictures"),
-    "musicas":    os.path.join(os.path.expanduser("~"), "Music"),
-    "videos":     os.path.join(os.path.expanduser("~"), "Videos"),
-}
+# ── Caminhos de screenshots ────────────────────────────────────────────────── #
+_PASTA_SCREENSHOTS = os.path.join(os.path.expanduser("~"), "Pictures", "Sirius")
 
 
-# ---------------------------------------------------------------------------
-# Navegador padrao via registro do Windows
-# ---------------------------------------------------------------------------
-
-def _obter_navegador_padrao():
+class SiriusControle:
     """
-    Le o navegador padrao configurado no Windows via registro.
-    Retorna (caminho_executavel_ou_comando, nome_amigavel).
-    Fallback em cascata: registro -> PATH -> start generico.
+    Módulo de controle do Windows para o S.I.R.I.U.S.
+
+    Todos os métodos:
+      • Rodam em primeiro plano (mas retornam rápido — Popen é non-blocking)
+      • Retornam str de confirmação para o Sirius falar ao Carlos
+      • Não movem mouse nem digitam (exceto executar_macro, que requer permissão)
     """
-    try:
-        import winreg
-        CHAVE = (
-            r"SOFTWARE\Microsoft\Windows\Shell\Associations"
-            r"\UrlAssociations\https\UserChoice"
-        )
-        prog_id = None
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CHAVE) as k:
-                prog_id = winreg.QueryValueEx(k, "ProgId")[0]
-        except Exception:
-            pass
 
-        if prog_id:
-            chave_cmd = r"SOFTWARE\Classes\{}\shell\open\command".format(prog_id)
-            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                try:
-                    with winreg.OpenKey(hive, chave_cmd) as k:
-                        cmd_str = winreg.QueryValueEx(k, "")[0]
-                        exes = re.findall(r'"([^"]+\.exe)"', cmd_str, re.IGNORECASE)
-                        if exes:
-                            nome = os.path.basename(exes[0]).lower().replace(".exe", "")
-                            return exes[0], nome
-                except Exception:
-                    continue
-    except ImportError:
-        pass
-
-    for nome, exe in [("chrome","chrome"),("msedge","msedge"),
-                      ("firefox","firefox"),("brave","brave"),("opera","opera")]:
-        if shutil.which(exe):
-            return exe, nome
-
-    return "start", "navegador padrao"
-
-
-# ---------------------------------------------------------------------------
-# Busca dinamica de apps instalados no Windows
-# ---------------------------------------------------------------------------
-
-def _buscar_no_registro(nome):
-    """
-    Busca o executavel no registro do Windows.
-    Cobre praticamente todos os apps instalados corretamente.
-    """
-    try:
-        import winreg
-        chaves = [
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
-            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
-        ]
-        nome_exe = nome if nome.endswith(".exe") else nome + ".exe"
-        for chave_base in chaves:
-            try:
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"{}\{}".format(chave_base, nome_exe)) as k:
-                    valor, _ = winreg.QueryValueEx(k, "")
-                    if valor and os.path.exists(valor):
-                        return valor
-            except Exception:
-                continue
-    except ImportError:
-        pass
-    return None
-
-
-def _buscar_no_startmenu(nome):
-    """
-    Busca no Menu Iniciar com scoring de relevancia.
-    Evita falsos positivos usando match exato antes de match parcial.
-    """
-    pastas_start = [
-        os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs"),
-        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs",
-        os.path.join(os.path.expanduser("~"), "Desktop"),
-    ]
-
-    nome_lower = nome.lower().strip()
-    candidatos = []  # lista de (score, caminho)
-
-    for pasta in pastas_start:
-        if not os.path.exists(pasta):
-            continue
-        for raiz, _, arquivos in os.walk(pasta):
-            for arquivo in arquivos:
-                if not arquivo.lower().endswith((".lnk", ".exe")):
-                    continue
-                nome_arquivo = os.path.splitext(arquivo)[0].lower()
-
-                if nome_arquivo == nome_lower:
-                    candidatos.append((100, os.path.join(raiz, arquivo)))
-                elif nome_lower in nome_arquivo.split():
-                    candidatos.append((80, os.path.join(raiz, arquivo)))
-                elif nome_arquivo.startswith(nome_lower):
-                    candidatos.append((60, os.path.join(raiz, arquivo)))
-                elif len(nome_lower) >= 4 and nome_lower in nome_arquivo:
-                    candidatos.append((30, os.path.join(raiz, arquivo)))
-
-    if not candidatos:
-        return None
-    candidatos.sort(key=lambda x: x[0], reverse=True)
-    return candidatos[0][1]
-
-
-def _buscar_nas_pastas_usuario(nome):
-    """Busca arquivos nas pastas comuns do usuario (documentos, desktop, downloads)."""
-    nome_lower = nome.lower().strip()
-    for pasta in [PASTAS_USUARIO["desktop"], PASTAS_USUARIO["documentos"],
-                  PASTAS_USUARIO["downloads"]]:
-        for raiz, _, arquivos in os.walk(pasta):
-            for arquivo in arquivos:
-                nome_arq = os.path.splitext(arquivo)[0].lower()
-                if nome_arq == nome_lower or nome_arq.startswith(nome_lower):
-                    return os.path.join(raiz, arquivo)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Classe principal
-# ---------------------------------------------------------------------------
-
-class SiriusControl:
     def __init__(self):
-        self._ultima_janela_focada = None
+        os.makedirs(_PASTA_SCREENSHOTS, exist_ok=True)
+        print("\033[92m[CONTROLE]: SiriusControle inicializado.\033[0m")
 
-    # -----------------------------------------------------------------------
-    # JANELAS
-    # -----------------------------------------------------------------------
+    # =========================================================================
+    # Programas e processos
+    # =========================================================================
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Utilitários de janela — centralizam busca e operações repetidas
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _encontrar_janela(self, titulo_parte: str):
+    def abrir_programa(self, nome_ou_caminho: str) -> str:
         """
-        Busca e retorna a primeira janela que contém titulo_parte no título.
-        Centraliza o loop 'for j in gw.getAllWindows()' que estava duplicado
-        em fechar_janela, minimizar_janela, maximizar_janela e _forcar_foco.
-        Retorna o objeto janela ou None.
+        Abre um programa em background via subprocess.Popen.
+
+        Aceita:
+          • Nome amigável: 'notepad', 'chrome', 'code', 'winword', 'excel'
+          • Caminho completo: r'C:\\Program Files\\...\\app.exe'
+          • Comando shell: 'start spotify'
         """
-        titulo_lower = titulo_parte.lower()
-        for j in gw.getAllWindows():
-            if j.title.strip() and titulo_lower in j.title.lower():
-                return j
-        return None
+        cmd = nome_ou_caminho.strip()
 
-    def _operacao_janela(self, titulo_parte: str,
-                          fn_acao,
-                          msg_ok: str,
-                          msg_erro: str) -> str:
-        """
-        Factory de operação de janela.
-
-        Encapsula o padrão repetido:
-          1. Encontra a janela
-          2. Executa fn_acao(janela)
-          3. Retorna msg_ok ou msg_erro formatada
-
-        Uso:
-          return self._operacao_janela(
-              titulo_parte,
-              fn_acao  = lambda j: j.minimize(),
-              msg_ok   = "Minimizei '{titulo}'.",
-              msg_erro = "Não achei janela com '{titulo}'.",
-          )
-
-        msg_ok e msg_erro aceitam {titulo} como placeholder.
-        """
-        try:
-            j = self._encontrar_janela(titulo_parte)
-            if not j:
-                return msg_erro.format(titulo=titulo_parte)
-            fn_acao(j)
-            return msg_ok.format(titulo=j.title)
-        except Exception as e:
-            return f"Erro na operação de janela: {e}"
-
-    def _forcar_foco(self, titulo_parte: str) -> bool:
-        """Foca a janela — retorna True se conseguiu."""
-        try:
-            j = self._encontrar_janela(titulo_parte)
-            if not j:
-                return False
-            if j.isMinimized:
-                j.restore()
-                time.sleep(0.15)
-            j.activate()
-            time.sleep(0.15)
-            self._ultima_janela_focada = j.title
-            return True
-        except Exception:
-            return False
-
-    def listar_janelas(self):
-        try:
-            janelas = [j.title for j in gw.getAllWindows() if j.title.strip()]
-            if not janelas:
-                return "Nao ha janelas abertas."
-            return "Janelas abertas:\n" + "\n".join("- " + t for t in janelas[:20])
-        except Exception as e:
-            return "Erro ao listar janelas: " + str(e)
-
-    def fechar_janela(self, titulo_parte: str) -> str:
-        return self._operacao_janela(
-            titulo_parte,
-            fn_acao  = lambda j: j.close(),
-            msg_ok   = "Fechei '{titulo}'.",
-            msg_erro = "Nao achei janela com '{titulo}' pra fechar.",
-        )
-
-    def minimizar_janela(self, titulo_parte: str) -> str:
-        return self._operacao_janela(
-            titulo_parte,
-            fn_acao  = lambda j: j.minimize(),
-            msg_ok   = "Minimizei '{titulo}'.",
-            msg_erro = "Nao achei janela com '{titulo}'.",
-        )
-
-    def maximizar_janela(self, titulo_parte: str) -> str:
-        return self._operacao_janela(
-            titulo_parte,
-            fn_acao  = lambda j: j.maximize(),
-            msg_ok   = "Maximizei '{titulo}'.",
-            msg_erro = "Nao achei janela com '{titulo}'.",
-        )
-
-    def mover_janela(self, titulo_parte, direcao="direita"):
-        try:
-            if self._forcar_foco(titulo_parte):
-                seta = "right" if "dire" in direcao.lower() else "left"
-                pyautogui.hotkey("win", "shift", seta)
-                return "Movi '{}' para a {}.".format(titulo_parte, direcao)
-            return "Nao achei janela com '{}' pra mover.".format(titulo_parte)
-        except Exception as e:
-            return "Erro ao mover janela: " + str(e)
-
-    def alternar_janela(self):
-        pyautogui.hotkey("alt", "tab")
-        return "Alternei para a proxima janela."
-
-    # -----------------------------------------------------------------------
-    # NAVEGADOR — sempre usa o padrao do sistema
-    # -----------------------------------------------------------------------
-
-    def abrir_navegador(self, url=""):
-        """Abre o navegador padrao do Windows detectado via registro."""
-        exe, nome = _obter_navegador_padrao()
-        try:
-            if url:
-                if not url.startswith("http"):
-                    url = "https://" + url
-                if exe == "start":
-                    os.system('start "" "{}"'.format(url))
-                else:
-                    subprocess.Popen([exe, url])
-                return "Abrindo {} no {}...".format(url, nome)
-            else:
-                if exe == "start":
-                    os.system('start "" "https://www.google.com"')
-                else:
-                    subprocess.Popen([exe])
-                return "Abrindo o {}...".format(nome)
-        except Exception as e:
-            try:
-                os.system('start "" "https://www.google.com"')
-                return "Abri o navegador padrao."
-            except Exception:
-                return "Erro ao abrir navegador: " + str(e)
-
-    def pesquisar_na_web(self, query):
-        import urllib.parse
-        url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
-        return self.abrir_navegador(url)
-
-    def abrir_url(self, url):
-        return self.abrir_navegador(url)
-
-    # -----------------------------------------------------------------------
-    # PROGRAMAS — busca dinamica em cascata
-    # -----------------------------------------------------------------------
-
-    def abrir_programa(self, nome):
-        """
-        Abre qualquer programa instalado no Windows.
-        Ordem de busca:
-        1. Palavras de navegador  -> sempre abre o padrao do sistema
-        2. Apps do sistema        -> comandos diretos (notepad, calc, etc)
-        3. PATH global            -> shutil.which
-        4. Registro do Windows    -> cobre 99% dos apps instalados corretamente
-        5. Menu Iniciar           -> atalhos .lnk com scoring
-        6. Pastas do usuario      -> documentos, desktop, downloads
-        """
-        nome_l = nome.strip().lower()
-        print("[CONTROLE]: Tentando abrir '{}'".format(nome_l))
-
-        # 1. Navegador
-        if nome_l in PALAVRAS_NAVEGADOR:
-            return self.abrir_navegador()
-
-        # 2. Apps do sistema com comando direto
-        cmd = APPS_SISTEMA.get(nome_l)
-        if cmd:
-            try:
-                if cmd.startswith("ms-"):
-                    os.system("start " + cmd)
-                else:
-                    subprocess.Popen(cmd, shell=True)
-                return "Abrindo {}...".format(nome)
-            except Exception as e:
-                return "Erro ao abrir '{}': {}".format(nome, e)
-
-        # 3. PATH global (git, python, node, etc)
-        if shutil.which(nome_l):
-            try:
-                subprocess.Popen(nome_l, shell=True)
-                return "Iniciando {}...".format(nome_l)
-            except Exception as e:
-                return "Erro ao executar '{}': {}".format(nome_l, e)
-
-        # 4. Registro do Windows — apps instalados corretamente
-        caminho_reg = _buscar_no_registro(nome_l)
-        if caminho_reg:
-            try:
-                os.startfile(caminho_reg)
-                return "Abrindo {} pelo registro!".format(nome)
-            except Exception as e:
-                return "Encontrei '{}' no registro mas deu erro: {}".format(nome, e)
-
-        # 5. Menu Iniciar com scoring
-        caminho_start = _buscar_no_startmenu(nome_l)
-        if caminho_start:
-            try:
-                os.startfile(caminho_start)
-                return "Achei '{}' no menu iniciar e abri!".format(
-                    os.path.basename(caminho_start))
-            except Exception as e:
-                return "Achei no menu mas deu erro: " + str(e)
-
-        # 6. Pastas do usuario
-        caminho_pasta = _buscar_nas_pastas_usuario(nome_l)
-        if caminho_pasta:
-            try:
-                os.startfile(caminho_pasta)
-                return "Achei '{}' e abri!".format(os.path.basename(caminho_pasta))
-            except Exception as e:
-                return "Achei mas deu erro: " + str(e)
-
-        return (
-            "Mano, nao achei '{}' em lugar nenhum. "
-            "Verifica se o nome ta certo ou se o app ta instalado."
-        ).format(nome)
-
-    def fechar_programa(self, nome):
-        nome_l = nome.strip().lower()
-        exe = APPS_SISTEMA.get(nome_l, nome_l)
-        if not exe.endswith(".exe"):
-            exe += ".exe"
-        try:
-            result = subprocess.run(["taskkill", "/f", "/im", exe],
-                                    capture_output=True, text=True)
-            if result.returncode == 0:
-                return "Fechei o {} com sucesso.".format(nome)
-            return self.fechar_janela(nome)
-        except Exception as e:
-            return "Erro ao fechar {}: {}".format(nome, e)
-
-    # -----------------------------------------------------------------------
-    # ARQUIVOS E PASTAS
-    # -----------------------------------------------------------------------
-
-    def criar_arquivo_texto(self, nome_arquivo, conteudo, pasta="documentos"):
-        try:
-            nome_l = nome_arquivo.strip().replace(" ", "_").lower()
-            if "." not in nome_l:
-                nome_l += ".txt"
-            pasta_dest = PASTAS_USUARIO.get(pasta.lower(), PASTAS_USUARIO["documentos"])
-            os.makedirs(pasta_dest, exist_ok=True)
-            caminho = os.path.join(pasta_dest, nome_l)
-            with open(caminho, "w", encoding="utf-8") as f:
-                f.write(conteudo.strip().replace('"', ""))
-            return "Arquivo '{}' criado em {}!".format(nome_l, os.path.basename(pasta_dest))
-        except Exception as e:
-            return "Erro ao criar arquivo: " + str(e)
-
-    def abrir_pasta(self, nome="documentos"):
-        pasta = PASTAS_USUARIO.get(nome.lower())
-        if pasta and os.path.exists(pasta):
-            os.startfile(pasta)
-            return "Abri a pasta {}.".format(nome)
-        if os.path.exists(nome):
-            os.startfile(nome)
-            return "Abri a pasta {}.".format(nome)
-        return "Nao encontrei a pasta '{}'.".format(nome)
-
-    def screenshot(self, nome=""):
-        try:
-            pasta = PASTAS_USUARIO["imagens"]
-            os.makedirs(pasta, exist_ok=True)
-            if not nome:
-                nome = "screenshot_{}.png".format(int(time.time()))
-            elif not nome.endswith(".png"):
-                nome += ".png"
-            pyautogui.screenshot(os.path.join(pasta, nome))
-            return "Screenshot salvo como '{}' em Imagens.".format(nome)
-        except Exception as e:
-            return "Erro ao tirar screenshot: " + str(e)
-
-    # -----------------------------------------------------------------------
-    # CLIPBOARD
-    # -----------------------------------------------------------------------
-
-    def copiar_texto(self, texto):
-        try:
-            pyperclip.copy(texto)
-            return "Copiei: '{}'".format(texto[:50])
-        except Exception as e:
-            return "Erro ao copiar: " + str(e)
-
-    def colar_texto(self):
-        pyautogui.hotkey("ctrl", "v")
-        return "Conteudo colado."
-
-    def obter_clipboard(self):
-        try:
-            c = pyperclip.paste()
-            return "Clipboard: '{}'".format(c[:200]) if c else "Clipboard vazio."
-        except Exception:
-            return "Nao consegui ler o clipboard."
-
-    # -----------------------------------------------------------------------
-    # VOLUME E MIDIA
-    # -----------------------------------------------------------------------
-
-    def controle_hardware(self, acao, repeticoes=3):
-        mapa = {
-            "volume_mais":     ("volumeup",  "Volume aumentado."),
-            "volume_menos":    ("volumedown","Volume diminuido."),
-            "mutar":           ("volumemute","Audio mutado/desmutado."),
-            "proxima_musica":  ("nexttrack", "Proxima faixa."),
-            "musica_anterior": ("prevtrack", "Faixa anterior."),
-            "pausar_musica":   ("playpause", "Play/Pause ativado."),
-            "parar_musica":    ("stop",      "Reproducao parada."),
+        # Mapa de apelidos para comandos reais
+        _APELIDOS = {
+            "word":       "start winword",
+            "winword":    "start winword",
+            "excel":      "start excel",
+            "powerpoint": "start powerpnt",
+            "outlook":    "start outlook",
+            "chrome":     "start chrome",
+            "firefox":    "start firefox",
+            "edge":       "start msedge",
+            "notepad":    "notepad",
+            "bloco de notas": "notepad",
+            "code":       "start code",
+            "vscode":     "start code",
+            "vs code":    "start code",
+            "terminal":   "start cmd",
+            "cmd":        "start cmd",
+            "powershell": "start powershell",
+            "explorer":   "explorer",
+            "discord":    "start discord",
+            "spotify":    "start spotify",
+            "taskmgr":    "taskmgr",
+            "calculadora": "calc",
+            "calc":       "calc",
+            "paint":      "mspaint",
         }
-        if acao not in mapa:
-            return "Acao '{}' nao reconhecida.".format(acao)
-        tecla, msg = mapa[acao]
-        n = repeticoes if acao in ("volume_mais", "volume_menos") else 1
-        for _ in range(n):
-            pyautogui.press(tecla)
-        return msg
 
-    # -----------------------------------------------------------------------
-    # ENERGIA
-    # -----------------------------------------------------------------------
+        cmd_real = _APELIDOS.get(cmd.lower(), cmd)
 
-    def gerenciar_energia(self, acao, delay_seg=60):
-        acao = acao.lower().strip()
-        if acao in ("desligar", "shutdown"):
-            os.system("shutdown /s /t {}".format(delay_seg))
-            return "PC desliga em {}s. Diz 'cancela desligar' pra abortar.".format(delay_seg)
-        if acao in ("reiniciar", "restart", "reboot"):
-            os.system("shutdown /r /t {}".format(delay_seg))
-            return "Reiniciando em {}s!".format(delay_seg)
-        if acao in ("suspender", "suspend", "sleep"):
-            os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
-            return "Suspendendo..."
-        if acao in ("hibernar", "hibernate"):
-            os.system("shutdown /h")
-            return "Hibernando..."
-        if acao in ("cancelar", "cancel"):
-            os.system("shutdown /a")
-            return "Operacao cancelada! PC sobreviveu."
-        if acao in ("bloquear", "lock"):
-            os.system("rundll32.exe user32.dll,LockWorkStation")
-            return "PC bloqueado."
-        return "Acao desconhecida: '{}'.".format(acao)
-
-    # -----------------------------------------------------------------------
-    # TECLADO E MOUSE
-    # -----------------------------------------------------------------------
-
-    def digitar_texto(self, texto):
         try:
-            time.sleep(0.1)
-            pyautogui.typewrite(texto, interval=0.05)
-            return "Digitei: '{}'".format(texto[:60])
+            subprocess.Popen(cmd_real, shell=True)
+            nome_curto = cmd.split("\\")[-1].replace("start ", "").title()
+            return f"{nome_curto} iniciado em segundo plano."
         except Exception as e:
-            return "Erro ao digitar: " + str(e)
+            return f"⚠ Falha ao abrir '{cmd}': {e}"
 
-    def pressionar_tecla(self, tecla):
-        try:
-            tecla = tecla.lower().strip()
-            if "+" in tecla:
-                pyautogui.hotkey(*[t.strip() for t in tecla.split("+")])
-            else:
-                pyautogui.press(tecla)
-            return "Tecla '{}' pressionada.".format(tecla)
-        except Exception as e:
-            return "Erro ao pressionar tecla: " + str(e)
-
-    def mover_mouse(self, x, y):
-        try:
-            pyautogui.moveTo(x, y, duration=0.3)
-            return "Mouse em ({}, {}).".format(x, y)
-        except Exception as e:
-            return "Erro ao mover mouse: " + str(e)
-
-    def clicar(self, x=None, y=None, botao="left"):
-        try:
-            if x is not None and y is not None:
-                pyautogui.click(x, y, button=botao)
-            else:
-                pyautogui.click(button=botao)
-            return "Clicado."
-        except Exception as e:
-            return "Erro ao clicar: " + str(e)
-
-    def rolar_pagina(self, direcao="baixo", quantidade=3):
-        clicks = -quantidade if "baixo" in direcao else quantidade
-        pyautogui.scroll(clicks)
-        return "Rolei para {}.".format(direcao)
-
-    # -----------------------------------------------------------------------
-    # MENSAGENS — Discord, WhatsApp, Telegram, Slack
-    # -----------------------------------------------------------------------
-
-    def _abrir_app_mensagem(self, plataforma, app):
+    def fechar_programa(self, nome: str) -> str:
         """
-        Garante que o app de mensagem esteja aberto e em foco.
-        Tenta focar primeiro. Se nao conseguir, abre o app e aguarda carregar.
-        Retorna True se conseguiu focar, False caso contrario.
+        Encerra um programa pelo nome do processo (ex: 'chrome', 'notepad').
+        Usa taskkill para garantir encerramento mesmo sem psutil.
         """
-        # Tentativa 1: ja esta aberto, so foca
-        if self._forcar_foco(app["titulo"]):
-            return True
-
-        print("[CONTROLE]: {} nao esta aberto. Abrindo...".format(plataforma))
-
-        # Tenta abrir pelo nome direto (PATH ou mapa)
-        exe = APPS_SISTEMA.get(plataforma.lower(), plataforma.lower())
+        nome = nome.strip()
         try:
-            subprocess.Popen(exe, shell=True)
-        except Exception:
-            try:
-                os.system("start {}".format(plataforma.lower()))
-            except Exception:
-                pass
-
-        # Aguarda o app abrir — tenta em intervalos de 2s por ate 20s
-        for tentativa in range(10):
-            time.sleep(2)
-            if self._forcar_foco(app["titulo"]):
-                print("[CONTROLE]: {} abriu na tentativa {}.".format(
-                    plataforma, tentativa + 1))
-                time.sleep(1)  # aguarda renderizacao completa
-                return True
-
-        return False
-
-    def enviar_mensagem_universal(self, plataforma, destinatario, mensagem):
-        """
-        Envia mensagem via automacao de GUI.
-        Abre o app automaticamente se nao estiver aberto.
-        """
-        app = APPS_MENSAGENS.get(plataforma.lower())
-        if not app:
-            return "App '{}' nao configurado.".format(plataforma)
-
-        # Abre o app se necessario
-        if not self._abrir_app_mensagem(plataforma, app):
-            return (
-                "Tentei abrir o {} mas nao consegui focar nele. "
-                "Abre manualmente e tenta de novo.".format(plataforma)
+            # Garante a extensão .exe se não tiver
+            alvo = nome if nome.lower().endswith(".exe") else f"{nome}.exe"
+            result = subprocess.run(
+                ["taskkill", "/IM", alvo, "/F"],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
-
-        # Pequena pausa apos foco para garantir que a UI esta pronta
-        time.sleep(0.2)
-        pyautogui.press("escape")
-        time.sleep(0.1)
-
-        # Abre a busca de contato
-        pyautogui.hotkey(*app["atalho_busca"])
-        time.sleep(0.25)
-
-        # Cola o nome do destinatario
-        pyperclip.copy(destinatario)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.7)
-        pyautogui.press("enter")
-        time.sleep(0.7)
-
-        # Cola a mensagem e envia
-        pyperclip.copy(mensagem)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.1)
-        pyautogui.press("enter")
-
-        return "Mensagem enviada para {} no {}.".format(destinatario, plataforma)
-
-    # -----------------------------------------------------------------------
-    # CRIAR ARQUIVO COM CONTEUDO
-    # -----------------------------------------------------------------------
-
-    def criar_arquivo_com_conteudo(self, nome_arquivo, conteudo, pasta="documentos"):
-        """
-        Cria um arquivo com qualquer extensao e conteudo.
-        Suporta: .txt, .py, .html, .md, .json, .csv, .bat, .js, .css
-        """
-        try:
-            nome_l = nome_arquivo.strip().replace(" ", "_")
-            # Garante que tem extensao
-            if "." not in nome_l:
-                nome_l += ".txt"
-
-            pasta_dest = PASTAS_USUARIO.get(pasta.lower(), PASTAS_USUARIO["documentos"])
-            os.makedirs(pasta_dest, exist_ok=True)
-            caminho = os.path.join(pasta_dest, nome_l)
-
-            conteudo_final = conteudo if conteudo else ""
-
-            with open(caminho, "w", encoding="utf-8") as f:
-                f.write(conteudo_final)
-
-            tamanho = len(conteudo_final)
-            return (
-                "Arquivo '{}' criado em {} com {} caracteres! "
-                "Caminho: {}".format(
-                    nome_l,
-                    os.path.basename(pasta_dest),
-                    tamanho,
-                    caminho
-                )
-            )
+            if result.returncode == 0:
+                return f"{nome} encerrado."
+            else:
+                return f"⚠ Não foi possível encerrar '{nome}': {result.stderr.strip()}"
         except Exception as e:
-            return "Erro ao criar arquivo: " + str(e)
+            return f"⚠ Erro ao fechar '{nome}': {e}"
 
-    # -----------------------------------------------------------------------
-    # SISTEMA
-    # -----------------------------------------------------------------------
+    def matar_processo(self, nome_ou_pid: Union[str, int]) -> str:
+        """
+        Mata um processo pelo nome (substring) ou PID.
+        Mais granular que fechar_programa — usa psutil quando disponível.
+        """
+        if _PSUTIL_OK:
+            return self._matar_com_psutil(nome_ou_pid)
+        # Fallback: taskkill
+        return self.fechar_programa(str(nome_ou_pid))
 
-    def info_sistema(self):
+    def _matar_com_psutil(self, nome_ou_pid: Union[str, int]) -> str:
+        mortos = []
         try:
-            import platform
-            s = platform.uname()
-            return "Sistema: {} {}\nMaquina: {}\nCPU: {}\nNode: {}".format(
-                s.system, s.release, s.machine, s.processor or "N/A", s.node)
+            # Por PID
+            if isinstance(nome_ou_pid, int) or str(nome_ou_pid).isdigit():
+                pid = int(nome_ou_pid)
+                p = psutil.Process(pid)
+                nome = p.name()
+                p.kill()
+                return f"Processo {nome} (PID {pid}) encerrado."
+
+            # Por nome (substring, case-insensitive)
+            alvo = str(nome_ou_pid).lower()
+            for p in psutil.process_iter(["pid", "name"]):
+                if alvo in (p.info["name"] or "").lower():
+                    try:
+                        p.kill()
+                        mortos.append(p.info["name"])
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+            if mortos:
+                return f"Encerrado(s): {', '.join(mortos)}."
+            return f"Nenhum processo com '{nome_ou_pid}' encontrado."
         except Exception as e:
-            return "Erro: " + str(e)
+            return f"⚠ Erro ao matar processo: {e}"
 
-    def uso_cpu_ram(self):
-        """
-        Retorna status completo do sistema:
-        CPU | RAM | Disco livre | Bateria (se notebook)
-        Responde a: "como ta o sistema", "cpu", "ram", "ta pesado", etc.
-        """
+    def uso_cpu_ram(self) -> str:
+        """Retorna string com uso atual de CPU e RAM."""
+        if not _PSUTIL_OK:
+            return "⚠ psutil não instalado — pip install psutil"
         try:
-            import psutil
-
             cpu = psutil.cpu_percent(interval=0.5)
             ram = psutil.virtual_memory()
+            estado = (
+                "⚠ CRÍTICO" if cpu > 90 or ram.percent > 90
+                else "moderado" if cpu > 60 or ram.percent > 70
+                else "tranquilo"
+            )
+            return (
+                f"CPU: {cpu:.0f}% | RAM: {ram.percent:.0f}% "
+                f"({ram.used // 1024**2}/{ram.total // 1024**2} MB) — {estado}"
+            )
+        except Exception as e:
+            return f"⚠ Erro ao ler recursos: {e}"
 
-            # Disco — pasta do usuario
+    # =========================================================================
+    # Volume do sistema
+    # =========================================================================
+
+    def gerenciar_volume(self, acao: Union[str, int]) -> str:
+        """
+        Controla o volume do Windows.
+
+        acao pode ser:
+          'aumentar'  → +10%
+          'diminuir'  → -10%
+          'silenciar' → mute
+          int (0-100) → nível absoluto via nircmd (se instalado)
+        """
+        try:
+            if isinstance(acao, int) or (isinstance(acao, str) and acao.isdigit()):
+                nivel = max(0, min(100, int(acao)))
+                return self._volume_absoluto(nivel)
+
+            acao = str(acao).lower().strip()
+
+            if acao in ("aumentar", "subir", "mais", "up"):
+                self._tecla_volume("up", repeticoes=5)
+                return "Volume aumentado."
+
+            if acao in ("diminuir", "baixar", "menos", "down"):
+                self._tecla_volume("down", repeticoes=5)
+                return "Volume diminuído."
+
+            if acao in ("silenciar", "mudo", "mute", "mutar"):
+                self._tecla_volume("mute")
+                return "Volume silenciado."
+
+            return f"⚠ Ação de volume desconhecida: '{acao}'"
+
+        except Exception as e:
+            return f"⚠ Erro ao controlar volume: {e}"
+
+    def _tecla_volume(self, direcao: str, repeticoes: int = 1):
+        """Simula teclas de volume via PowerShell (background-safe)."""
+        _MAPA = {
+            "up":   "0xAF",   # VK_VOLUME_UP
+            "down": "0xAE",   # VK_VOLUME_DOWN
+            "mute": "0xAD",   # VK_VOLUME_MUTE
+        }
+        vk = _MAPA.get(direcao, "0xAF")
+        script = (
+            f"$wsh = New-Object -ComObject WScript.Shell; "
+            + ("$wsh.SendKeys([char][int]" + vk + "); ") * repeticoes
+        )
+        subprocess.Popen(
+            ["powershell", "-WindowStyle", "Hidden", "-Command", script],
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+
+    def _volume_absoluto(self, nivel: int) -> str:
+        """Define volume absoluto via nircmd (se disponível) ou PowerShell."""
+        # Tenta nircmd primeiro (mais preciso)
+        try:
+            subprocess.run(
+                ["nircmd", "setsysvolume", str(int(nivel / 100 * 65535))],
+                capture_output=True, timeout=3
+            )
+            return f"Volume definido para {nivel}%."
+        except FileNotFoundError:
+            pass
+
+        # Fallback via PowerShell Audio API
+        script = f"""
+        $vol = [math]::Round({nivel} / 100 * 65535);
+        $wsh = New-Object -ComObject WScript.Shell;
+        # Reseta para 0 e sobe até o nivel
+        for($i=0;$i -lt 50;$i++){{$wsh.SendKeys([char][int]0xAE)}};
+        $steps = [math]::Round({nivel} / 2);
+        for($i=0;$i -lt $steps;$i++){{$wsh.SendKeys([char][int]0xAF)}};
+        """
+        subprocess.Popen(
+            ["powershell", "-WindowStyle", "Hidden", "-Command", script],
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        return f"Volume ajustado para ~{nivel}%."
+
+    # =========================================================================
+    # Screenshot
+    # =========================================================================
+
+    def tirar_screenshot(self, nome: Optional[str] = None) -> str:
+        """
+        Captura a tela e salva em ~/Pictures/Sirius/.
+        Retorna o caminho do arquivo salvo.
+        """
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        nome_arquivo = nome or f"screenshot_{ts}.png"
+        caminho = os.path.join(_PASTA_SCREENSHOTS, nome_arquivo)
+
+        if _PIL_OK:
             try:
-                disco = psutil.disk_usage(os.path.expanduser("~"))
-                disco_livre_gb = disco.free // (1024 ** 3)
-                disco_str = " | Disco: {} GB livres".format(disco_livre_gb)
-            except Exception:
-                disco_str = ""
+                img = ImageGrab.grab()
+                img.save(caminho)
+                return f"Screenshot salvo: {caminho}"
+            except Exception as e:
+                return f"⚠ Erro ao capturar tela (PIL): {e}"
 
-            # Bateria — so se for notebook
+        # Fallback via PowerShell
+        try:
+            script = (
+                f"Add-Type -AssemblyName System.Windows.Forms; "
+                f"$bmp = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                f"$img = New-Object System.Drawing.Bitmap($bmp.Width, $bmp.Height); "
+                f"$gfx = [System.Drawing.Graphics]::FromImage($img); "
+                f"$gfx.CopyFromScreen($bmp.Location, [System.Drawing.Point]::Empty, $bmp.Size); "
+                f"$img.Save('{caminho}');"
+            )
+            subprocess.run(
+                ["powershell", "-WindowStyle", "Hidden", "-Command", script],
+                timeout=10,
+            )
+            return f"Screenshot salvo: {caminho}"
+        except Exception as e:
+            return f"⚠ Erro ao capturar tela (PowerShell): {e}"
+
+    # =========================================================================
+    # Arquivos e área de transferência
+    # =========================================================================
+
+    def criar_arquivo_com_conteudo(
+        self,
+        nome:     str,
+        conteudo: str,
+        pasta:    str = "",
+    ) -> str:
+        """
+        Cria um arquivo de texto com o conteúdo fornecido.
+        Se pasta não for informada, salva em ~/Documents.
+        """
+        if not pasta:
+            pasta = os.path.join(os.path.expanduser("~"), "Documents")
+
+        pasta = os.path.expandvars(pasta)
+        os.makedirs(pasta, exist_ok=True)
+        caminho = os.path.join(pasta, nome)
+
+        try:
+            with open(caminho, "w", encoding="utf-8") as f:
+                f.write(conteudo)
+            return f"Arquivo criado: {caminho}"
+        except Exception as e:
+            return f"⚠ Erro ao criar arquivo: {e}"
+
+    def copiar_para_area_transferencia(self, texto: str) -> str:
+        """Copia texto para a área de transferência."""
+        if _PYPERCLIP_OK:
             try:
-                bat = psutil.sensors_battery()
-                if bat is not None:
-                    carregando = " (carregando)" if bat.power_plugged else ""
-                    bat_str = " | Bateria: {:.0f}%{}".format(bat.percent, carregando)
-                else:
-                    bat_str = ""
-            except Exception:
-                bat_str = ""
+                pyperclip.copy(str(texto))
+                return f"Copiado para a área de transferência ({len(texto)} caracteres)."
+            except Exception as e:
+                return f"⚠ Erro ao copiar (pyperclip): {e}"
 
-            # Monta resposta amigavel
-            ram_usada_gb  = ram.used  // (1024 ** 2)
-            ram_total_gb  = ram.total // (1024 ** 2)
-            ram_pct       = ram.percent
+        # Fallback via PowerShell
+        try:
+            texto_esc = texto.replace("'", "''")
+            subprocess.run(
+                ["powershell", "-Command", f"Set-Clipboard '{texto_esc}'"],
+                timeout=5,
+            )
+            return "Copiado para a área de transferência."
+        except Exception as e:
+            return f"⚠ Erro ao copiar (PowerShell): {e}"
 
-            # Avaliacao do estado geral
-            if cpu > 80 or ram_pct > 85:
-                estado = "Ta pesado, chefia!"
-            elif cpu > 50 or ram_pct > 60:
-                estado = "Ta moderado."
-            else:
-                estado = "Ta tranquilo."
+    # =========================================================================
+    # Web e comunicação
+    # =========================================================================
 
-            return "CPU: {:.0f}% | RAM: {:.0f}% ({} / {} MB){}{} — {}".format(
-                cpu, ram_pct, ram_usada_gb, ram_total_gb,
-                disco_str, bat_str, estado
+    def abrir_url(self, url: str) -> str:
+        """Abre uma URL no navegador padrão."""
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        try:
+            webbrowser.open(url)
+            return f"URL aberta: {url}"
+        except Exception as e:
+            return f"⚠ Erro ao abrir URL: {e}"
+
+    def pesquisar_na_web(self, query: str) -> str:
+        """Pesquisa no Google via navegador padrão."""
+        query_enc = query.strip().replace(" ", "+")
+        url = f"https://www.google.com/search?q={query_enc}"
+        try:
+            webbrowser.open(url)
+            return f"Pesquisando: '{query}'"
+        except Exception as e:
+            return f"⚠ Erro ao pesquisar: {e}"
+
+    def enviar_mensagem_universal(
+        self,
+        plataforma:   str,
+        destinatario: str,
+        mensagem:     str,
+    ) -> str:
+        """
+        Abre a plataforma com um link de mensagem pré-preenchido.
+        Suporta: 'whatsapp', 'telegram', 'discord'.
+
+        Nota: para automação real de digitação, use executar_macro().
+        """
+        plat = plataforma.lower().strip()
+        msg_enc = mensagem.strip().replace(" ", "%20")
+
+        if plat == "whatsapp":
+            num = re.sub(r"\D", "", destinatario)
+            url = f"https://wa.me/{num}?text={msg_enc}"
+            webbrowser.open(url)
+            return f"WhatsApp aberto para {destinatario}."
+
+        if plat == "telegram":
+            url = f"https://t.me/{destinatario}?text={msg_enc}"
+            webbrowser.open(url)
+            return f"Telegram aberto para {destinatario}."
+
+        if plat == "discord":
+            # Discord não tem deep-link universal de DM — abre o app
+            subprocess.Popen("start discord", shell=True)
+            return (
+                f"Discord aberto. Para automação completa de mensagens, "
+                "peça ao Carlos para usar executar_macro()."
             )
 
-        except ImportError:
-            return "psutil nao instalado. Rode: pip install psutil"
-        except Exception as e:
-            return "Erro ao checar sistema: " + str(e)
+        return f"⚠ Plataforma não suportada: '{plataforma}'. Use: whatsapp, telegram, discord."
 
-    def processos_ativos(self, top_n=10):
+    # =========================================================================
+    # Utilitários do sistema
+    # =========================================================================
+
+    def listar_processos(self, filtro: str = "") -> str:
+        """Lista processos em execução, opcionalmente filtrado por nome."""
+        if not _PSUTIL_OK:
+            return "⚠ psutil não instalado."
         try:
-            import psutil
-            procs = sorted(psutil.process_iter(["pid","name","cpu_percent"]),
-                           key=lambda p: p.info["cpu_percent"], reverse=True)[:top_n]
-            return "Top processos:\n" + "\n".join(
-                "{} (PID {}) - {:.1f}%".format(p.info["name"],p.info["pid"],p.info["cpu_percent"])
-                for p in procs)
-        except ImportError:
-            return "Instale psutil: pip install psutil"
+            procs = [
+                f"{p.info['name']} (PID {p.info['pid']})"
+                for p in psutil.process_iter(["pid", "name"])
+                if filtro.lower() in (p.info["name"] or "").lower()
+            ]
+            if not procs:
+                return f"Nenhum processo com '{filtro}' encontrado."
+            return "\n".join(procs[:20])  # limita a 20 para não lotar o áudio
         except Exception as e:
-            return "Erro: " + str(e)
+            return f"⚠ Erro ao listar processos: {e}"
 
-    def matar_processo(self, nome_ou_pid):
+    def abrir_pasta(self, caminho: str) -> str:
+        """Abre uma pasta no Explorador de Arquivos."""
+        caminho = os.path.expandvars(caminho.strip())
+        if not os.path.exists(caminho):
+            return f"⚠ Caminho não encontrado: {caminho}"
         try:
-            import psutil
-            alvo = nome_ou_pid.strip()
-            for proc in psutil.process_iter(["pid","name"]):
-                if alvo.isdigit() and proc.info["pid"] == int(alvo):
-                    proc.kill()
-                    return "PID {} encerrado.".format(alvo)
-                if alvo.lower() in proc.info["name"].lower():
-                    proc.kill()
-                    return "Processo '{}' encerrado.".format(proc.info["name"])
-            return "Processo '{}' nao encontrado.".format(alvo)
-        except ImportError:
-            return self.fechar_programa(nome_ou_pid)
+            subprocess.Popen(f'explorer "{caminho}"', shell=True)
+            return f"Pasta aberta: {caminho}"
         except Exception as e:
-            return "Erro: " + str(e)
+            return f"⚠ Erro ao abrir pasta: {e}"
 
-    # -----------------------------------------------------------------------
-    # MACROS
-    # -----------------------------------------------------------------------
+    def desligar(self, minutos: int = 0) -> str:
+        """Agenda ou executa o desligamento do PC. minutos=0 → imediato."""
+        segundos = minutos * 60
+        try:
+            subprocess.run(
+                ["shutdown", "/s", "/t", str(segundos)],
+                check=True, capture_output=True,
+            )
+            msg = "agora" if minutos == 0 else f"em {minutos} minutos"
+            return f"PC será desligado {msg}."
+        except Exception as e:
+            return f"⚠ Erro ao agendar desligamento: {e}"
 
-    def executar_macro(self, comandos):
-        resultados = []
-        for cmd in comandos:
-            cmd = cmd.strip()
-            if cmd.startswith("tecla:"):
-                resultados.append(self.pressionar_tecla(cmd[6:]))
-            elif cmd.startswith("digitar:"):
-                resultados.append(self.digitar_texto(cmd[8:]))
-            elif cmd.startswith("esperar:"):
-                try:
-                    time.sleep(float(cmd[8:]))
-                    resultados.append("Esperou {}s.".format(cmd[8:]))
-                except Exception:
-                    pass
-            elif cmd.startswith("abrir:"):
-                resultados.append(self.abrir_programa(cmd[6:]))
-            elif cmd.startswith("fechar:"):
-                resultados.append(self.fechar_janela(cmd[7:]))
-            else:
-                resultados.append("Comando desconhecido: '{}'".format(cmd))
-        return "\n".join(resultados)
+    def cancelar_desligamento(self) -> str:
+        """Cancela um desligamento agendado."""
+        try:
+            subprocess.run(["shutdown", "/a"], check=True, capture_output=True)
+            return "Desligamento cancelado."
+        except Exception as e:
+            return f"⚠ Erro ao cancelar: {e}"
+
+    # =========================================================================
+    # executar_macro — uso explícito com pyautogui (requer permissão do Carlos)
+    # =========================================================================
+
+    def executar_macro(self, acoes: list[dict]) -> str:
+        """
+        Executa uma sequência de ações com pyautogui.
+        USE APENAS quando Carlos pedir explicitamente "digitar" ou "clicar".
+
+        Formato de acoes:
+          [
+            {"tipo": "escrever",  "texto": "Olá"},
+            {"tipo": "clicar",    "x": 100, "y": 200},
+            {"tipo": "tecla",     "tecla": "enter"},
+            {"tipo": "esperar",   "segundos": 1.0},
+            {"tipo": "hotkey",    "teclas": ["ctrl", "c"]},
+          ]
+        """
+        try:
+            import pyautogui
+            import time as _time
+
+            pyautogui.FAILSAFE  = True
+            pyautogui.PAUSE     = 0.05
+
+            for acao in acoes:
+                tipo = str(acao.get("tipo", "")).lower()
+
+                if tipo == "escrever":
+                    pyautogui.write(str(acao.get("texto", "")), interval=0.03)
+
+                elif tipo == "clicar":
+                    x = int(acao.get("x", 0))
+                    y = int(acao.get("y", 0))
+                    btn = str(acao.get("botao", "left"))
+                    pyautogui.click(x, y, button=btn)
+
+                elif tipo == "duplo_clique":
+                    pyautogui.doubleClick(int(acao.get("x", 0)), int(acao.get("y", 0)))
+
+                elif tipo == "tecla":
+                    pyautogui.press(str(acao.get("tecla", "")))
+
+                elif tipo == "hotkey":
+                    teclas = acao.get("teclas", [])
+                    pyautogui.hotkey(*teclas)
+
+                elif tipo == "mover":
+                    pyautogui.moveTo(int(acao.get("x", 0)), int(acao.get("y", 0)))
+
+                elif tipo == "scroll":
+                    pyautogui.scroll(int(acao.get("clicks", 3)))
+
+                elif tipo == "esperar":
+                    _time.sleep(float(acao.get("segundos", 1.0)))
+
+                else:
+                    print(f"[CONTROLE MACRO]: Ação desconhecida: '{tipo}'")
+
+            return f"Macro executado ({len(acoes)} ações)."
+
+        except ImportError:
+            return "⚠ pyautogui não instalado — pip install pyautogui"
+        except pyautogui.FailSafeException:
+            return "⚠ Macro interrompido: mouse no canto da tela (failsafe)."
+        except Exception as e:
+            return f"⚠ Erro na macro: {e}"
+
+
+# =============================================================================
+# Standalone
+# =============================================================================
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  SiriusControle — Teste Standalone")
+    print("=" * 55)
+
+    c = SiriusControle()
+
+    print("\n[CPU/RAM]")
+    print(" ", c.uso_cpu_ram())
+
+    print("\n[CLIPBOARD]")
+    print(" ", c.copiar_para_area_transferencia("Teste do SiriusControle"))
+
+    print("\n[SCREENSHOT]")
+    print(" ", c.tirar_screenshot())
+
+    print("\n[ABRIR PROGRAMA]")
+    print(" ", c.abrir_programa("notepad"))
+
+    print("\nTeste concluído.")

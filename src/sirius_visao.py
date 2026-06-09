@@ -1,615 +1,661 @@
 """
-sirius_visao.py — Visão computacional do Sirius
+sirius_visao.py — S.I.R.I.U.S. v5.2 — Visão Computacional
+===========================================================
 
-O Sirius consegue VER a tela e responder sobre o que está acontecendo.
+Substitui o arquivo que existia apenas como patch.
+Esta é a classe real, completa e auto-suficiente.
 
 Capacidades:
-  - "o que tem na tela?" → descreve o conteúdo da tela
-  - "lê o que está escrito na tela" → extrai texto via OCR
-  - "o que é esse erro?" → analisa mensagens de erro na tela
-  - "resume o que está aberto" → resume o conteúdo visível
-  - "tira print e analisa" → captura + analisa
-  - Leitura automática pelo SiriusLeitor (ponto de extensão)
+  • OCR de imagens e screenshots (pytesseract com fallback easyocr)
+  • Captura de tela completa via pyautogui
+  • analisar_tela()              → lê e descreve o que está na tela
+  • ler_texto(caminho)           → OCR de arquivo de imagem
+  • ler_tela(caminho)            → alias de ler_texto (compatibilidade leitor)
+  • identificar_botoes_em_imagem → detecta elementos clicáveis via OCR + contornos
+  • extrair_erro_tela()          → OCR reativo só quando há erro Python na tela
+                                   (chamado pelo GerenciadorContexto em DESENVOLVIMENTO)
 
-Tecnologia:
-  - pyautogui   → captura de tela
-  - pytesseract → OCR (extração de texto)
-  - Pillow       → processamento de imagem
-  - Sem API externa — 100% local
+Dependências opcionais (fallback gracioso se ausentes):
+    pip install pyautogui Pillow pytesseract
+    pip install easyocr          # fallback OCR sem Tesseract instalado
+    pip install opencv-python    # para identificar_botoes_em_imagem
+
+Interface pública usada pelo ecossistema:
+    get_visao() → SiriusVisao   (singleton — importe assim)
+
+    visao.analisar_tela(pergunta)           → str
+    visao.ler_texto(caminho_imagem)         → str
+    visao.ler_tela(caminho_imagem)          → str  (alias)
+    visao.identificar_botoes_em_imagem(cam) → dict
+    visao.extrair_erro_tela()               → str | None
+    visao.capturar_tela(caminho=None)       → str | None
+    visao.status()                          → dict
 """
 
+from __future__ import annotations
+
+import hashlib
+import io
 import os
-import sys
 import re
-import time
+import sys
 import tempfile
+import threading
+import time
+from typing import Optional
 
-diretorio_src  = os.path.dirname(os.path.abspath(__file__))
-diretorio_raiz = os.path.dirname(diretorio_src)
-if diretorio_src not in sys.path:
-    sys.path.insert(0, diretorio_src)
+# =============================================================================
+# Paths
+# =============================================================================
 
-CAMINHO_SCREENSHOTS = os.path.join(diretorio_raiz, "data", "screenshots")
-os.makedirs(CAMINHO_SCREENSHOTS, exist_ok=True)
+_DIR_SRC  = os.path.dirname(os.path.abspath(__file__))
+_DIR_RAIZ = os.path.dirname(_DIR_SRC)
+_DIR_DATA = os.path.join(_DIR_RAIZ, "data")
+_DIR_SCREENSHOTS = os.path.join(_DIR_DATA, "screenshots")
+os.makedirs(_DIR_SCREENSHOTS, exist_ok=True)
+
+if _DIR_SRC not in sys.path:
+    sys.path.insert(0, _DIR_SRC)
+
+# =============================================================================
+# Detecção de dependências
+# =============================================================================
+
+_PYAUTOGUI_OK   = False
+_PYTESSERACT_OK = False
+_EASYOCR_OK     = False
+_OPENCV_OK      = False
+_PIL_OK         = False
+
+try:
+    import pyautogui as _pyautogui
+    _PYAUTOGUI_OK = True
+except ImportError:
+    pass
+
+try:
+    from PIL import Image as _PILImage, ImageChops as _ImageChops, ImageStat as _ImageStat
+    _PIL_OK = True
+except ImportError:
+    pass
+
+try:
+    import pytesseract as _pytesseract
+    _PYTESSERACT_OK = True
+except ImportError:
+    pass
+
+try:
+    import easyocr as _easyocr
+    _EASYOCR_OK = True
+except ImportError:
+    pass
+
+try:
+    import cv2 as _cv2
+    import numpy as _np
+    _OPENCV_OK = True
+except ImportError:
+    pass
 
 
-# ---------------------------------------------------------------------------
-# Instalação automática das dependências
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Padrões de erro Python para extrair_erro_tela
+# =============================================================================
 
-def _verificar_dependencias() -> dict:
-    """Verifica quais dependências estão disponíveis."""
-    status = {
-        "pyautogui":   False,
-        "pillow":      False,
-        "pytesseract": False,
-        "tesseract":   False,  # binário do sistema
-    }
-    try:
-        import pyautogui
-        status["pyautogui"] = True
-    except ImportError:
-        pass
+_TRIGGERS_ERRO = frozenset({
+    "exception", "traceback", "error", "runtimeerror", "nameerror",
+    "typeerror", "valueerror", "importerror", "keyerror", "indexerror",
+    "attributeerror", "filenotfounderror", "oserror", "permissionerror",
+    "syntaxerror", "indentationerror", "modulenotfounderror",
+    "zerodivisionerror", "recursionerror", "memoryerror",
+    "failed", "assert", "fatal",
+})
 
-    try:
-        from PIL import Image
-        status["pillow"] = True
-    except ImportError:
-        pass
-
-    try:
-        import pytesseract
-        pytesseract.get_tesseract_version()
-        status["pytesseract"] = True
-        status["tesseract"]   = True
-    except Exception:
-        pass
-
-    return status
+_COOLDOWN_CAPTURA = 3.0   # segundos mínimos entre capturas OCR reativas
+_LIMIAR_MUDANCA   = 0.01  # diff de pixel normalizada para "tela mudou"
 
 
-# ---------------------------------------------------------------------------
-# Extração de texto — OCR com pytesseract
-# ---------------------------------------------------------------------------
+# =============================================================================
+# OCR — camada de abstração com fallback automático
+# =============================================================================
 
-class ExtratorOCR:
+class _SiriusOCR:
     """
-    Extrai texto de imagens usando pytesseract (Tesseract OCR).
-    100% local, sem API.
-
-    Instalação:
-        pip install pytesseract Pillow
-        # Windows: instalar Tesseract OCR
-        # https://github.com/UB-Mannheim/tesseract/wiki
-        # Adicionar ao PATH ou definir TESSERACT_CMD abaixo
+    Abstração de OCR com cascata automática:
+      1. pytesseract (rápido, requer Tesseract instalado no sistema)
+      2. easyocr     (mais pesado, funciona sem instalação extra)
+      3. fallback    (retorna string vazia com aviso)
     """
-
-    # Caminho do executável Tesseract no Windows
-    TESSERACT_PATHS = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"C:\Users\{user}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
-    ]
 
     def __init__(self):
-        self._disponivel = False
-        self._configurar()
+        self._easyocr_reader = None
+        self._lock           = threading.Lock()
 
-    def _configurar(self):
+    def _get_easyocr(self):
+        if self._easyocr_reader is None and _EASYOCR_OK:
+            try:
+                self._easyocr_reader = _easyocr.Reader(["pt", "en"], gpu=False, verbose=False)
+            except Exception as e:
+                print(f"[OCR]: EasyOCR falhou ao inicializar: {e}")
+        return self._easyocr_reader
+
+    def extrair_texto(self, caminho_imagem: str) -> str:
+        """
+        Extrai texto de um arquivo de imagem.
+        Tenta pytesseract primeiro, cai em easyocr se falhar.
+        """
+        if not os.path.exists(caminho_imagem):
+            return ""
+
+        # 1. pytesseract
+        if _PYTESSERACT_OK and _PIL_OK:
+            try:
+                img  = _PILImage.open(caminho_imagem)
+                texto = _pytesseract.image_to_string(img, lang="por+eng")
+                if texto.strip():
+                    return texto.strip()
+            except Exception as e:
+                print(f"[OCR]: pytesseract falhou: {e}")
+
+        # 2. easyocr
+        if _EASYOCR_OK:
+            with self._lock:
+                reader = self._get_easyocr()
+                if reader:
+                    try:
+                        resultados = reader.readtext(caminho_imagem, detail=0)
+                        texto = " ".join(resultados).strip()
+                        if texto:
+                            return texto
+                    except Exception as e:
+                        print(f"[OCR]: EasyOCR falhou: {e}")
+
+        if not _PYTESSERACT_OK and not _EASYOCR_OK:
+            print(
+                "[OCR]: Nenhum motor disponível. Instale:\n"
+                "  pip install pytesseract Pillow   (+ Tesseract no sistema)\n"
+                "  pip install easyocr              (alternativa sem instalação)"
+            )
+        return ""
+
+    def extrair_de_pil(self, img) -> str:
+        """Extrai texto direto de uma imagem PIL sem salvar em disco."""
+        if not _PIL_OK:
+            return ""
+
+        # pytesseract aceita PIL direto
+        if _PYTESSERACT_OK:
+            try:
+                return _pytesseract.image_to_string(img, lang="por+eng").strip()
+            except Exception:
+                pass
+
+        # easyocr requer arquivo — salva temporário
         try:
-            import pytesseract
-
-            # Tenta encontrar o executável automaticamente no Windows
-            usuario = os.environ.get("USERNAME", "")
-            for caminho in self.TESSERACT_PATHS:
-                caminho_exp = caminho.replace("{user}", usuario)
-                if os.path.exists(caminho_exp):
-                    pytesseract.pytesseract.tesseract_cmd = caminho_exp
-                    break
-
-            pytesseract.get_tesseract_version()
-            self._disponivel = True
-            print("\033[92m[VISAO]: Tesseract OCR disponível.\033[0m")
-
-        except Exception as e:
-            print(f"\033[33m[VISAO]: Tesseract não disponível — OCR desabilitado.\033[0m")
-            print(f"  Para instalar: https://github.com/UB-Mannheim/tesseract/wiki")
-            print(f"  Depois: pip install pytesseract")
-
-    def extrair_texto(self, imagem_path: str) -> str:
-        """Extrai texto de uma imagem via OCR."""
-        if not self._disponivel:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                img.save(tmp.name)
+                caminho = tmp.name
+            texto = self.extrair_texto(caminho)
+            try:
+                os.remove(caminho)
+            except Exception:
+                pass
+            return texto
+        except Exception:
             return ""
 
-        try:
-            import pytesseract
-            from PIL import Image, ImageFilter, ImageEnhance
 
-            img = Image.open(imagem_path)
+# =============================================================================
+# Comparação de telas
+# =============================================================================
 
-            # Redimensiona para melhorar OCR (2x se for pequena)
-            w, h = img.size
-            if w < 1200:
-                img = img.resize((w * 2, h * 2), Image.LANCZOS)
-
-            # Pré-processamento
-            img = img.convert("L")                       # escala de cinza
-            img = img.filter(ImageFilter.SHARPEN)        # nitidez
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.8)
-
-            # OCR com configuração que respeita espaços e layout
-            # --psm 6 = bloco uniforme de texto (melhor para telas)
-            # --oem 3 = motor LSTM (mais preciso)
-            texto = pytesseract.image_to_string(
-                img,
-                lang="por+eng",
-                config="--psm 6 --oem 3"
-            )
-
-            return self._limpar_texto_ocr(texto)
-
-        except Exception as e:
-            print(f"[VISAO]: Erro no OCR: {e}")
-            return ""
-
-    def _limpar_texto_ocr(self, texto: str) -> str:
-        """
-        Corrige problemas comuns do OCR em telas:
-        - Palavras coladas: 'OláMundo' → 'Olá Mundo'
-        - Caracteres especiais do OCR: |, 1→l, 0→O
-        - Linhas em branco excessivas
-        """
-        import re
-
-        if not texto:
-            return ""
-
-        # Remove caracteres não-imprimíveis exceto newline e tab
-        texto = re.sub(r"[^\x20-\x7E\x80-\xFF\n\t]", " ", texto)
-
-        # Corrige palavras coladas: detecta transições minúscula→Maiúscula no meio
-        # Ex: "DiálogoÉuma" → "Diálogo É uma"
-        texto = re.sub(r"([a-záéíóúàãõêôç])([A-ZÁÉÍÓÚÀÃÕÊÔÇ])", r"\1 \2", texto)
-
-        # Corrige múltiplos espaços
-        texto = re.sub(r"[ \t]{2,}", " ", texto)
-
-        # Remove linhas com só 1-2 caracteres (lixo do OCR)
-        linhas = []
-        for linha in texto.split("\n"):
-            linha = linha.strip()
-            if len(linha) > 2:
-                linhas.append(linha)
-
-        # Remove blocos de linhas em branco consecutivas
-        resultado = []
-        em_branco = 0
-        for linha in linhas:
-            if not linha:
-                em_branco += 1
-                if em_branco <= 1:
-                    resultado.append("")
-            else:
-                em_branco = 0
-                resultado.append(linha)
-
-        return "\n".join(resultado).strip()
-
-    @property
-    def disponivel(self) -> bool:
-        return self._disponivel
+def _hash_imagem(img) -> str:
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=False)
+        return hashlib.sha1(buf.getvalue()).hexdigest()
+    except Exception:
+        return str(time.time())
 
 
-# ---------------------------------------------------------------------------
-# Analisador de conteúdo — interpreta o texto extraído
-# ---------------------------------------------------------------------------
-
-class AnalisadorTela:
+def _telas_diferentes(img1, img2, limiar: float = _LIMIAR_MUDANCA) -> bool:
     """
-    Interpreta o texto extraído da tela e gera descrições úteis.
-    100% local — sem IA externa.
+    Retorna True se a diferença média de pixels entre as duas imagens
+    superar o limiar (normalizado 0–1).
     """
-
-    # Padrões de elementos comuns na tela
-    _PADROES = {
-        "erro": [
-            r"error\b", r"exception\b", r"traceback", r"erro\b",
-            r"falhou", r"failed", r"crash", r"não encontrado",
-            r"access denied", r"permission denied",
-        ],
-        "codigo": [
-            r"def\s+\w+", r"import\s+\w+", r"class\s+\w+",
-            r"function\s+\w+", r"var\s+\w+", r"const\s+\w+",
-            r"#include", r"public\s+static",
-        ],
-        "url": [
-            r"https?://\S+", r"www\.\S+",
-        ],
-        "email": [
-            r"\b[\w.+-]+@[\w-]+\.\w+\b",
-        ],
-        "numero": [
-            r"\b\d{4,}\b",
-        ],
-    }
-
-    def _detectar_tipo(self, texto: str) -> str:
-        """Detecta o tipo de conteúdo na tela."""
-        texto_l = texto.lower()
-
-        for tipo, padroes in self._PADROES.items():
-            for p in padroes:
-                if re.search(p, texto_l):
-                    return tipo
-
-        # Heurísticas simples
-        if len(texto.split("\n")) > 20:
-            return "documento"
-        if len(texto.split()) > 50:
-            return "texto_longo"
-        return "geral"
-
-    def _resumir(self, texto: str, max_chars: int = 500) -> str:
-        """Gera um resumo do texto."""
-        if not texto:
-            return "Não consegui extrair texto da tela."
-
-        linhas = [l.strip() for l in texto.split("\n") if len(l.strip()) > 3]
-        if not linhas:
-            return "A tela parece estar vazia ou com apenas elementos visuais."
-
-        # Pega as linhas mais informativas
-        resumo = " | ".join(linhas[:8])
-        if len(resumo) > max_chars:
-            resumo = resumo[:max_chars] + "..."
-
-        return resumo
-
-    def analisar(self, texto: str, modo: str = "geral") -> str:
-        """
-        Gera uma resposta natural sobre o conteúdo da tela.
-        modo: 'geral' | 'erro' | 'ler' | 'resumir' | 'codigo'
-        """
-        if not texto or len(texto.strip()) < 5:
-            return (
-                "Não consegui ler o que está na tela. "
-                "Pode ser que o conteúdo seja uma imagem ou esteja em baixa resolução."
-            )
-
-        # ── Detecta se o OCR produziu lixo ────────────────────────────────
-        if self._ocr_e_lixo(texto):
-            return (
-                "Capturei a tela mas o conteúdo é visual ou tem texto estilizado "
-                "que o OCR não consegue ler bem. "
-                "Se quiser que eu leia um texto específico, "
-                "tenta deixar só a janela com o texto em foco."
-            )
-
-        tipo = self._detectar_tipo(texto)
-        linhas = [l.strip() for l in texto.split("\n") if len(l.strip()) > 2]
-        n_palavras = len(texto.split())
-
-        # Modo leitura — retorna o texto completo
-        if modo == "ler":
-            if len(texto) > 800:
-                return (
-                    f"O texto na tela é longo, uns {n_palavras} palavras. "
-                    f"Aqui as primeiras linhas:\n{chr(10).join(linhas[:10])}"
-                )
-            return f"O que está escrito:\n{texto[:600]}"
-
-        # Modo erro
-        if modo == "erro" or tipo == "erro":
-            erros = [l for l in linhas
-                     if any(re.search(p, l.lower()) for p in self._PADROES["erro"])]
-            if erros:
-                return (
-                    f"Detectei um erro: '{erros[0][:200]}'. "
-                    f"Total de {len(erros)} linha(s) com problema. "
-                    "Quer que eu pesquise sobre esse erro?"
-                )
-            return f"Não identifiquei erros claros. O que vi: {self._resumir(texto)}"
-
-        # Modo código
-        if tipo == "codigo" or modo == "codigo":
-            linguagem = (
-                "Python"     if any(k in texto for k in ["def ", "import ", "elif "]) else
-                "JavaScript" if any(k in texto for k in ["function ", "const ", "let "]) else
-                "código"
-            )
-            return (
-                f"Tem {linguagem} na tela com {n_palavras} palavras. "
-                f"Primeiras linhas:\n{chr(10).join(linhas[:5])}"
-            )
-
-        # Modo resumo / geral
-        resumo = self._resumir(texto)
-        if tipo == "documento":
-            return f"Tem um documento com ~{n_palavras} palavras. Resumo: {resumo}"
-        if tipo == "url":
-            urls = re.findall(r"https?://\S+", texto)
-            return f"Vejo URLs: {', '.join(urls[:3])}. Contexto: {resumo}"
-
-        return f"Na tela: {resumo}"
-
-    def _ocr_e_lixo(self, texto: str) -> bool:
-        """
-        Detecta se o resultado do OCR é inútil.
-        Critérios:
-        - Mais de 40% de caracteres especiais/lixo
-        - Palavras médias muito curtas (menos de 2 chars)
-        - Poucas palavras reais reconhecíveis
-        """
-        if not texto:
-            return True
-
-        import re as _re
-
-        # Remove espaços e newlines para análise
-        chars_validos = _re.sub(r"[a-záéíóúàãõêôç\w\s]", "", texto.lower())
-        pct_lixo = len(chars_validos) / max(len(texto), 1)
-        if pct_lixo > 0.35:
-            return True
-
-        # Analisa palavras
-        palavras = [p for p in texto.split() if len(p) > 1]
-        if not palavras:
-            return True
-
-        # Se a maioria das "palavras" são sequências sem vogal = lixo
-        sem_vogal = [p for p in palavras if not _re.search(r"[aeiouáéíóú]", p.lower())]
-        if len(sem_vogal) / len(palavras) > 0.6:
-            return True
-
-        # Comprimento médio de palavras muito baixo = lixo
-        media_len = sum(len(p) for p in palavras) / len(palavras)
-        if media_len < 2.5:
-            return True
-
-        return False
+    if not _PIL_OK:
+        return _hash_imagem(img1) != _hash_imagem(img2)
+    try:
+        w, h   = img1.size
+        p1     = img1.resize((w // 4, h // 4)).convert("L")
+        p2     = img2.resize((w // 4, h // 4)).convert("L")
+        diff   = _ImageChops.difference(p1, p2)
+        stats  = _ImageStat.Stat(diff)
+        return (stats.mean[0] / 255.0) > limiar
+    except Exception:
+        return _hash_imagem(img1) != _hash_imagem(img2)
 
 
-# ---------------------------------------------------------------------------
-# Classe principal — SiriusVisao
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SiriusVisao — classe principal
+# =============================================================================
 
 class SiriusVisao:
     """
-    Interface principal de visão computacional do Sirius.
+    Módulo de visão computacional do S.I.R.I.U.S. v5.2.
 
-    Uso pelo cerebro.py:
-        visao = SiriusVisao()
-        resposta = visao.analisar_tela("o que tem na tela")
+    Singleton via get_visao(). Todas as operações são thread-safe.
+    Todas as dependências (pyautogui, pytesseract, cv2) são opcionais —
+    o sistema nunca crasha por ausência delas.
 
-    Uso pelo sirius_leitor.py (ponto de extensão):
-        texto = visao.ler_texto(caminho_screenshot)
+    Métodos públicos:
+        analisar_tela(pergunta)              → str
+        ler_texto(caminho)                   → str  (OCR de arquivo)
+        ler_tela(caminho)                    → str  (alias de ler_texto)
+        identificar_botoes_em_imagem(caminho)→ dict
+        extrair_erro_tela()                  → str | None
+        capturar_tela(caminho=None)          → str | None
+        status()                             → dict
     """
 
     def __init__(self):
-        self._ocr       = ExtratorOCR()
-        self._analisador = AnalisadorTela()
-        self._ultimo_screenshot = None
+        self._ocr  = _SiriusOCR()
+        self._lock = threading.Lock()
 
-    # -----------------------------------------------------------------------
-    # Captura de tela
-    # -----------------------------------------------------------------------
+        # Estado para extrair_erro_tela()
+        self._ultimo_extrair_erro:    float = 0.0
+        self._ultima_captura_reativa         = None   # PIL Image
 
-    def tirar_screenshot(self, nome: str = None) -> str | None:
+        if not _PYAUTOGUI_OK:
+            print(
+                "[VISAO]: pyautogui não instalado — captura de tela desabilitada.\n"
+                "  pip install pyautogui Pillow"
+            )
+        if not _PYTESSERACT_OK and not _EASYOCR_OK:
+            print(
+                "[VISAO]: Nenhum motor OCR disponível.\n"
+                "  pip install pytesseract Pillow   (+ Tesseract binário)\n"
+                "  pip install easyocr              (sem binário externo)"
+            )
+
+    # =========================================================================
+    # capturar_tela — screenshot para arquivo
+    # =========================================================================
+
+    def capturar_tela(self, caminho: Optional[str] = None) -> Optional[str]:
         """
-        Captura a tela atual e salva em arquivo.
-        Retorna o caminho do arquivo ou None se falhar.
+        Captura a tela inteira e salva em arquivo.
+
+        Args:
+            caminho: caminho do arquivo de saída (opcional).
+                     Se None, gera nome automático em data/screenshots/.
+        Returns:
+            Caminho do arquivo salvo, ou None se falhou.
         """
-        try:
-            import pyautogui
-            from PIL import Image
-
-            screenshot = pyautogui.screenshot()
-
-            if nome:
-                nome_limpo = re.sub(r"[^\w]", "_", nome) + ".png"
-            else:
-                nome_limpo = f"screenshot_{int(time.time())}.png"
-
-            caminho = os.path.join(CAMINHO_SCREENSHOTS, nome_limpo)
-            screenshot.save(caminho)
-            self._ultimo_screenshot = caminho
-            return caminho
-
-        except ImportError:
-            print("[VISAO]: pip install pyautogui Pillow")
+        if not _PYAUTOGUI_OK:
             return None
+        try:
+            if caminho is None:
+                nome    = f"screen_{int(time.time())}.png"
+                caminho = os.path.join(_DIR_SCREENSHOTS, nome)
+
+            screenshot = _pyautogui.screenshot()
+            screenshot.save(caminho)
+            return caminho
         except Exception as e:
             print(f"[VISAO]: Erro ao capturar tela: {e}")
             return None
 
-    # -----------------------------------------------------------------------
-    # Ponto de extensão para sirius_leitor.py
-    # -----------------------------------------------------------------------
+    # =========================================================================
+    # ler_texto / ler_tela — OCR de arquivo
+    # =========================================================================
 
-    def ler_texto(self, imagem_path: str) -> str:
+    def ler_texto(self, caminho_imagem: str) -> str:
         """
-        Interface para o SiriusLeitor — extrai texto de qualquer imagem.
-        Substitui o método extrair_de_screenshot vazio no sirius_leitor.py.
-        """
-        return self._ocr.extrair_texto(imagem_path)
+        Extrai texto de um arquivo de imagem via OCR.
 
-    # -----------------------------------------------------------------------
-    # Análise da tela — chamado pelo cerebro.py
-    # -----------------------------------------------------------------------
-
-    def analisar_tela(self, comando: str = "geral") -> str:
+        Usado por:
+            sirius_leitor.py → extrator.extrair_de_screenshot()
+            sirius_server.py → (via get_visao().ler_tela())
         """
-        Captura a tela e analisa conforme o comando.
-        Retorna uma resposta em linguagem natural.
-        """
-        # Detecta o modo de análise pelo comando
-        modo = self._detectar_modo(comando)
+        if not caminho_imagem or not os.path.exists(caminho_imagem):
+            return ""
+        return self._ocr.extrair_texto(caminho_imagem)
 
-        # Captura a tela
-        caminho = self.tirar_screenshot()
-        if not caminho:
+    def ler_tela(self, caminho_imagem: str) -> str:
+        """Alias de ler_texto() para compatibilidade com sirius_leitor.py."""
+        return self.ler_texto(caminho_imagem)
+
+    # =========================================================================
+    # analisar_tela — OCR da tela atual + resposta contextual
+    # =========================================================================
+
+    def analisar_tela(self, pergunta: str = "") -> str:
+        """
+        Captura a tela, extrai texto via OCR e retorna uma resposta
+        contextualizada à pergunta do usuário.
+
+        Usado por:
+            sirius_moe.py → EspecialistaVisao.executar()
+            cerebro.py    → quando usuário pede "o que está na tela"
+
+        Args:
+            pergunta: o que o usuário quer saber sobre a tela
+
+        Returns:
+            Texto descrevendo o conteúdo da tela, ou mensagem de erro.
+        """
+        if not _PYAUTOGUI_OK:
             return (
-                "Não consegui capturar a tela. "
+                "Não consigo ver a tela agora. "
                 "Instale: pip install pyautogui Pillow"
             )
 
-        # Extrai texto via OCR
-        texto_ocr = self._ocr.extrair_texto(caminho)
-
-        # Analisa e gera resposta
-        resposta = self._analisador.analisar(texto_ocr, modo)
-
-        print(f"\033[94m[VISAO]: Screenshot salvo em {caminho}\033[0m")
-        return resposta
-
-    def _detectar_modo(self, comando: str) -> str:
-        """Detecta o que o usuário quer fazer com a tela."""
-        c = comando.lower()
-        if any(p in c for p in ["lê", "le ", "leia", "ler", "o que diz", "o que está escrito"]):
-            return "ler"
-        if any(p in c for p in ["erro", "error", "bug", "problema", "falha"]):
-            return "erro"
-        if any(p in c for p in ["codigo", "código", "script", "programa"]):
-            return "codigo"
-        if any(p in c for p in ["resume", "resumo", "sintetiza", "o que tem"]):
-            return "resumir"
-        return "geral"
-
-    def analisar_regiao(self, x: int, y: int, largura: int, altura: int) -> str:
-        """Analisa uma região específica da tela."""
         try:
-            import pyautogui
-            from PIL import Image
+            screenshot = _pyautogui.screenshot()
+            texto_ocr  = self._ocr.extrair_de_pil(screenshot)
 
-            screenshot = pyautogui.screenshot(region=(x, y, largura, altura))
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                caminho_tmp = f.name
-            screenshot.save(caminho_tmp)
+            if not texto_ocr:
+                return "Capturei a tela mas não encontrei texto legível."
 
-            texto = self._ocr.extrair_texto(caminho_tmp)
-            try:
-                os.remove(caminho_tmp)
-            except Exception:
-                pass
+            # Trunca para não sobrecarregar o contexto
+            texto_truncado = texto_ocr[:2000]
 
-            return self._analisador.analisar(texto)
+            if pergunta:
+                return (
+                    f"Conteúdo da tela:\n{texto_truncado}\n\n"
+                    f"[Pergunta: {pergunta}]"
+                )
+            return f"Conteúdo da tela:\n{texto_truncado}"
 
         except Exception as e:
-            return f"Erro ao analisar região: {e}"
+            return f"Erro ao analisar tela: {e}"
 
-    def identificar_botoes_em_imagem(self, imagem_path: str) -> dict:
-        """Detecta elementos de interface na imagem e retorna coordenadas candidatas."""
-        try:
-            from PIL import Image
-            import pytesseract
-            from pytesseract import Output
+    # =========================================================================
+    # identificar_botoes_em_imagem — detecta elementos clicáveis
+    # =========================================================================
 
-            imagem = Image.open(imagem_path)
-            dados = pytesseract.image_to_data(
-                imagem,
-                lang="por+eng",
-                config="--psm 6 --oem 3",
-                output_type=Output.DICT
-            )
+    def identificar_botoes_em_imagem(self, caminho_imagem: str) -> dict:
+        """
+        Identifica botões e elementos clicáveis em uma imagem.
+        Usado pelo sirius_server.py no endpoint /visao/demonstracao.
 
-            elementos = []
-            for i, texto in enumerate(dados.get("text", [])):
-                if not texto or len(texto.strip()) < 2:
-                    continue
-                try:
-                    conf = float(dados.get("conf", [])[i] or -1)
-                except Exception:
-                    conf = -1
-                if conf < 20:
-                    continue
-                x = int(dados.get("left", [])[i] or 0)
-                y = int(dados.get("top", [])[i] or 0)
-                largura = int(dados.get("width", [])[i] or 0)
-                altura = int(dados.get("height", [])[i] or 0)
-                if largura <= 0 or altura <= 0:
-                    continue
+        Estratégia:
+          1. OCR → extrai texto de cada região (pytesseract com dados de bbox)
+          2. OpenCV → detecta contornos retangulares como regiões candidatas
+          3. Combina: regiões com texto são classificadas como botões
+
+        Args:
+            caminho_imagem: caminho do arquivo de imagem
+
+        Returns:
+            dict com:
+                elementos: list[dict] com keys texto, centro, largura, altura, tipo
+                total:     int
+                ocr_bruto: str (texto completo extraído)
+        """
+        if not os.path.exists(caminho_imagem):
+            return {"elementos": [], "total": 0, "ocr_bruto": "", "erro": "Arquivo não encontrado"}
+
+        elementos = []
+        ocr_bruto = ""
+
+        # ── 1. OCR com posição (pytesseract com output_type=dict) ─────────────
+        if _PYTESSERACT_OK and _PIL_OK:
+            try:
+                img = _PILImage.open(caminho_imagem)
+                dados = _pytesseract.image_to_data(
+                    img, lang="por+eng",
+                    output_type=_pytesseract.Output.DICT,
+                )
+                n = len(dados["text"])
+                for i in range(n):
+                    texto = str(dados["text"][i]).strip()
+                    conf  = int(dados["conf"][i]) if dados["conf"][i] != "-1" else 0
+                    if texto and conf > 40:
+                        x, y  = dados["left"][i], dados["top"][i]
+                        w, h   = dados["width"][i], dados["height"][i]
+                        if w > 5 and h > 5:
+                            elementos.append({
+                                "texto":   texto,
+                                "centro":  [x + w // 2, y + h // 2],
+                                "largura": w,
+                                "altura":  h,
+                                "confianca": conf,
+                                "tipo":    "texto_ocr",
+                            })
+                ocr_bruto = " ".join(
+                    t for t in dados["text"] if t.strip()
+                )
+            except Exception as e:
+                print(f"[VISAO]: pytesseract image_to_data falhou: {e}")
+                # Fallback: OCR simples sem posição
+                ocr_bruto = self._ocr.extrair_texto(caminho_imagem)
+
+        # ── 2. OpenCV — detecta contornos retangulares (botões sem texto) ─────
+        if _OPENCV_OK and not elementos:
+            try:
+                img_cv  = _cv2.imread(caminho_imagem)
+                if img_cv is not None:
+                    cinza   = _cv2.cvtColor(img_cv, _cv2.COLOR_BGR2GRAY)
+                    _, bw   = _cv2.threshold(cinza, 127, 255, _cv2.THRESH_BINARY)
+                    contours, _ = _cv2.findContours(
+                        bw, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    h_img, w_img = img_cv.shape[:2]
+                    for cnt in contours:
+                        x, y, w, h = _cv2.boundingRect(cnt)
+                        # Filtra contornos muito pequenos ou muito grandes
+                        area_ratio = (w * h) / (w_img * h_img)
+                        if 0.001 < area_ratio < 0.3 and w > 20 and h > 10:
+                            elementos.append({
+                                "texto":   "",
+                                "centro":  [x + w // 2, y + h // 2],
+                                "largura": w,
+                                "altura":  h,
+                                "confianca": 0,
+                                "tipo":    "contorno_cv2",
+                            })
+            except Exception as e:
+                print(f"[VISAO]: OpenCV falhou na detecção de contornos: {e}")
+
+        # ── 3. Fallback — OCR simples sem posição ─────────────────────────────
+        if not elementos and not ocr_bruto:
+            ocr_bruto = self._ocr.extrair_texto(caminho_imagem)
+            if ocr_bruto:
+                # Cria um elemento genérico com o texto todo
                 elementos.append({
-                    "texto": texto.strip(),
-                    "x": x,
-                    "y": y,
-                    "largura": largura,
-                    "altura": altura,
-                    "centro": [x + largura // 2, y + altura // 2],
-                    "conf": conf,
+                    "texto":   ocr_bruto[:200],
+                    "centro":  [0, 0],
+                    "largura": 0,
+                    "altura":  0,
+                    "confianca": 0,
+                    "tipo":    "ocr_simples",
                 })
 
-            return {
-                "imagem": os.path.basename(imagem_path),
-                "largura": imagem.width,
-                "altura": imagem.height,
-                "elementos": elementos,
-            }
-        except Exception as e:
-            return {
-                "imagem": os.path.basename(imagem_path),
-                "largura": None,
-                "altura": None,
-                "elementos": [],
-                "erro": str(e),
-            }
+        return {
+            "elementos": elementos,
+            "total":     len(elementos),
+            "ocr_bruto": ocr_bruto,
+        }
 
-    def esta_disponivel(self) -> bool:
-        """Retorna True se pelo menos screenshot funciona."""
+    # =========================================================================
+    # extrair_erro_tela — OCR reativo para contexto DESENVOLVIMENTO
+    # =========================================================================
+
+    def extrair_erro_tela(
+        self,
+        cooldown:        float = _COOLDOWN_CAPTURA,
+        limiar_mudanca:  float = _LIMIAR_MUDANCA,
+    ) -> Optional[str]:
+        """
+        Captura a tela e retorna o texto de erro SOMENTE se:
+          1. Passou o cooldown desde a última captura
+          2. A tela mudou significativamente
+          3. O texto contém padrões de erro Python/terminal
+
+        Chamado pelo GerenciadorContexto (sirius_gerador.py) quando
+        o contexto ativo é DESENVOLVIMENTO.
+
+        Returns:
+            str com texto de erro extraído (truncado a 1000 chars), ou
+            None se não houve mudança, sem erro, ou sem dependências.
+        """
+        agora = time.time()
+        if agora - self._ultimo_extrair_erro < cooldown:
+            return None
+        self._ultimo_extrair_erro = agora
+
+        if not _PYAUTOGUI_OK or not _PIL_OK:
+            return None
+
         try:
-            import pyautogui
-            return True
-        except ImportError:
-            return False
+            screenshot_atual = _pyautogui.screenshot()
+
+            # Compara com a captura anterior
+            if (self._ultima_captura_reativa is not None
+                    and not _telas_diferentes(
+                        self._ultima_captura_reativa,
+                        screenshot_atual,
+                        limiar_mudanca
+                    )):
+                return None   # tela não mudou → sem processamento
+
+            self._ultima_captura_reativa = screenshot_atual
+
+            # Extrai texto via OCR
+            texto = self._ocr.extrair_de_pil(screenshot_atual)
+            if not texto:
+                return None
+
+            # Verifica se há padrão de erro
+            texto_lower = texto.lower()
+            if not any(trigger in texto_lower for trigger in _TRIGGERS_ERRO):
+                return None
+
+            # Monta texto compacto: linhas de erro + contexto vizinho (máx 10)
+            linhas    = [l.strip() for l in texto.split("\n") if l.strip()]
+            resultado = []
+            for linha in linhas:
+                if any(t in linha.lower() for t in _TRIGGERS_ERRO):
+                    resultado.append(linha)
+                elif resultado:
+                    resultado.append(linha)
+                    if len([x for x in resultado if x]) >= 8:
+                        break
+
+            texto_final = "\n".join(resultado[:10])
+            return texto_final[:1000] if texto_final else None
+
+        except ImportError as e:
+            print(f"[VISAO]: extrair_erro_tela indisponível: {e}")
+            return None
+        except Exception as e:
+            print(f"[VISAO]: Erro em extrair_erro_tela: {e}")
+            return None
+
+    # =========================================================================
+    # status
+    # =========================================================================
 
     def status(self) -> dict:
-        deps = _verificar_dependencias()
         return {
-            "screenshot":        deps["pyautogui"],
-            "ocr_disponivel":    deps["pytesseract"],
-            "tesseract_ok":      deps["tesseract"],
-            "ultimo_screenshot": self._ultimo_screenshot,
+            "pyautogui":       _PYAUTOGUI_OK,
+            "pytesseract":     _PYTESSERACT_OK,
+            "easyocr":         _EASYOCR_OK,
+            "opencv":          _OPENCV_OK,
+            "pil":             _PIL_OK,
+            "ocr_disponivel":  _PYTESSERACT_OK or _EASYOCR_OK,
+            "captura_disponivel": _PYAUTOGUI_OK and _PIL_OK,
         }
 
 
-# ---------------------------------------------------------------------------
-# Singleton global — evita instanciar múltiplas vezes
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Singleton global
+# =============================================================================
 
-_visao_instance = None
+_visao_instance: Optional[SiriusVisao] = None
+_visao_lock = threading.Lock()
+
 
 def get_visao() -> SiriusVisao:
+    """
+    Retorna a instância singleton de SiriusVisao.
+    Thread-safe. Use sempre este método para obter a instância.
+
+    Uso:
+        from sirius_visao import get_visao
+        visao = get_visao()
+        texto = visao.analisar_tela("o que está aberto?")
+    """
     global _visao_instance
     if _visao_instance is None:
-        _visao_instance = SiriusVisao()
+        with _visao_lock:
+            if _visao_instance is None:
+                _visao_instance = SiriusVisao()
     return _visao_instance
 
 
-# ---------------------------------------------------------------------------
-# Standalone — testa a visão
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Standalone — smoke test
+# =============================================================================
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Testa o SiriusVisao")
-    parser.add_argument("--screenshot", action="store_true", help="Tira screenshot e mostra o texto")
-    parser.add_argument("--status",     action="store_true", help="Mostra status das dependências")
+
+    parser = argparse.ArgumentParser(description="SiriusVisao v5.2 — smoke test")
+    parser.add_argument("--status",   action="store_true", help="Exibe status dos módulos")
+    parser.add_argument("--tela",     action="store_true", help="Captura e analisa a tela")
+    parser.add_argument("--ocr",      type=str,            help="Faz OCR de um arquivo de imagem")
+    parser.add_argument("--botoes",   type=str,            help="Identifica botões em uma imagem")
+    parser.add_argument("--erro",     action="store_true", help="Testa extrair_erro_tela()")
     args = parser.parse_args()
 
-    visao = SiriusVisao()
+    print("\n\033[1m\033[96m" + "=" * 60)
+    print("  S.I.R.I.U.S. Visao v5.2")
+    print("=" * 60 + "\033[0m\n")
 
-    if args.status or not args.screenshot:
+    visao = get_visao()
+
+    if args.status or not any([args.tela, args.ocr, args.botoes, args.erro]):
         s = visao.status()
-        print("\n[VISAO STATUS]")
-        print(f"  Screenshot (pyautogui): {'✓' if s['screenshot'] else '✗ pip install pyautogui'}")
-        print(f"  OCR (pytesseract):      {'✓' if s['ocr_disponivel'] else '✗ pip install pytesseract'}")
-        print(f"  Tesseract binário:      {'✓' if s['tesseract_ok'] else '✗ instalar Tesseract OCR'}")
-        print(f"\n  Instalação completa:")
-        print(f"    pip install pyautogui Pillow pytesseract")
-        print(f"    Tesseract: https://github.com/UB-Mannheim/tesseract/wiki\n")
+        print("\033[95m[STATUS]\033[0m")
+        for k, v in s.items():
+            icone = "✓" if v else "✗"
+            cor   = "\033[92m" if v else "\033[91m"
+            print(f"  {cor}{icone}\033[0m {k}")
+        if not s["ocr_disponivel"]:
+            print("\n  Para ativar OCR:")
+            print("    pip install pytesseract Pillow  (+ Tesseract binário em https://github.com/UB-Mannheim/tesseract/wiki)")
+            print("    pip install easyocr             (sem binário externo, mais pesado)")
+        if not s["captura_disponivel"]:
+            print("\n  Para captura de tela:")
+            print("    pip install pyautogui Pillow")
 
-    if args.screenshot:
-        print("Tirando screenshot em 3 segundos...")
-        time.sleep(3)
-        resposta = visao.analisar_tela("o que tem na tela")
-        print(f"\nResposta: {resposta}")
+    if args.tela:
+        print("\n[TELA]: Analisando...")
+        resultado = visao.analisar_tela("o que está visível na tela?")
+        print(resultado[:500])
+
+    if args.ocr:
+        print(f"\n[OCR]: Extraindo texto de '{args.ocr}'...")
+        texto = visao.ler_texto(args.ocr)
+        print(texto[:500] or "(nenhum texto encontrado)")
+
+    if args.botoes:
+        print(f"\n[BOTOES]: Identificando elementos em '{args.botoes}'...")
+        resultado = visao.identificar_botoes_em_imagem(args.botoes)
+        print(f"  Total de elementos: {resultado['total']}")
+        for el in resultado["elementos"][:5]:
+            print(f"  • '{el['texto'][:40]}' em {el['centro']} ({el['tipo']})")
+
+    if args.erro:
+        print("\n[ERRO]: Testando extrair_erro_tela()...")
+        resultado = visao.extrair_erro_tela()
+        if resultado:
+            print(f"  Erro detectado:\n{resultado}")
+        else:
+            print("  Nenhum erro detectado na tela (ou sem mudança desde a última captura).")
+
+    print()

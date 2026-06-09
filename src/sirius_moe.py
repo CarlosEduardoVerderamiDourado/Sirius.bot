@@ -276,7 +276,7 @@ class EspecialistaAutomacao(EspecialistaBase):
 
         # Lista macros salvas
         if any(p in t for p in ["lista macros", "minhas macros", "quais macros"]):
-            # SiriusMemory não tem list_macros, então retornamos instrução
+            # SiriusMemoria não tem list_macros, então retornamos instrução
             return "Para ver suas macros, me diz o nome e eu executo. Para criar: 'cria macro [nome] que faz [ação]'."
 
         # Executa macro pelo nome

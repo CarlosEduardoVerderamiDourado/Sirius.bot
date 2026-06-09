@@ -59,7 +59,7 @@ class SiriusOSVision:
         Inicializa o modulo de visao.
         
         Args:
-            memoria: instancia de SiriusMemory para auditoria
+            memoria: instancia de SiriusMemoria para auditoria
             user_id: id do usuario para LGPD compliance
         """
         self.memoria = memoria

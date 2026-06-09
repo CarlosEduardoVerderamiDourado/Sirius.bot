@@ -588,7 +588,7 @@ class SiriusLeitor:
 
 if __name__ == "__main__":
     import argparse
-    from memoria import SiriusMemory
+    from memoria import SiriusMemoria
 
     parser = argparse.ArgumentParser(description="Testa o SiriusLeitor")
     parser.add_argument("--tema", type=str, default="artificial intelligence",
@@ -597,7 +597,7 @@ if __name__ == "__main__":
                         help="Roda em loop contínuo")
     args = parser.parse_args()
 
-    mem    = SiriusMemory()
+    mem    = SiriusMemoria()
     leitor = SiriusLeitor(memoria=mem)
 
     if args.continuo:

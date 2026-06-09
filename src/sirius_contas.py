@@ -446,7 +446,7 @@ class SiriusContas:
 
     @property
     def memoria_ativa(self):
-        """Retorna a SiriusMemory da conta ativa (com cache)."""
+        """Retorna a SiriusMemoria da conta ativa (com cache)."""
         conta = self.conta_ativa
         if not conta:
             return None
@@ -479,10 +479,10 @@ class SiriusContas:
             return None
 
     def _carregar_memoria(self, conta: Conta):
-        """Carrega ou cria a SiriusMemory da conta."""
+        """Carrega ou cria a SiriusMemoria da conta."""
         try:
-            from memoria import SiriusMemory
-            return SiriusMemory(db_pessoal=conta.caminho_db)
+            from memoria import SiriusMemoria
+            return SiriusMemoria(db_pessoal=conta.caminho_db)
         except Exception as e:
             print(f"[CONTAS]: Erro ao carregar memória de '{conta.nome}': {e}")
             return None
